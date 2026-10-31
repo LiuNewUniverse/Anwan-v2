@@ -1,0 +1,4 @@
+torch>=2.1.0
+# optional: CUDA + mamba-ssm for native Mamba2 backbone
+# mamba-ssm
+# causal-conv1d

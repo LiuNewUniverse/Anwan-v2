@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-安晚一体化统一模型 v2 —— 单文件自包含版（训练 + 对话一体）
-依赖：仅 torch（CPU 可跑）；mamba-ssm 可选（import 失败时自动回退到纯 PyTorch 简化 S6 实现）
-SSM 回退实现精度低于 Mamba2 原生，compare 命令会单独标注当前用的是哪种。
-
-用法：
-    1. 语料放进 train_data/（.txt / .json / .md）
-    2. build-tokenizer    （不做则词表仅 50 token，新语料全落 UNK）
-    3. train
-    4. chat
-多语：build-tokenizer --langpack langdata --vocab-size 22000 --merge-cap 20000
-子命令：tokenize | build-tokenizer | train | chat | eval | learn | mem | word | auto | moe-report | calibrate-emotion | baseline | compare（各子命令参数用 -h 查看）
-
-环境变量：ANWAN_BACKBONE(ssm|lstm) ANWAN_RETRIEVAL_MODE(full|facts_only) ANWAN_EMO_DIR_NORM(raw|std) ANWAN_MOE_SCOPE(all|decoder) ANWAN_EMOTION_STATE_MAX_NORM ANWAN_EMOTION_AROUSAL_MARGIN ANWAN_EMOTION_DECAY_DAYS
-
-数据落点：data/models/（词表/checkpoint/词本/记忆） train_data/（语料） 训练数据/（learn渐进阅读）
-"""
+"""安晚一体化统一模型 v2。用法、环境与更新日志见 README.md / CHANGELOG.md。"""
 
 import argparse
 import difflib
@@ -217,14 +201,20 @@ EXPERT_FF_DIM = 3072         # 单个专家的 FFN 中间宽度（原 FF_DIM 614
 MOE_LOAD_BALANCE_WEIGHT = 0.01  # 负载均衡 loss 权重（辅助项，小权重防专家坍缩）
 # ==================== v3 半专家化（全域专家 + 情感半专家）====================
 # 升级口径：不是再加一个新模块，而是把已有 4 条通道统一换成同一套专家化骨架。
-#   · 专家模型（纯 MoE）：内容 LSTM-A / 检索 TF-1 / 生成 TF-2 —— 参数可扩、激活不扩。
+#   · 专家模型（纯 MoE）：内容双向 Transformer / 检索 TF-1 / 生成 TF-2 —— 参数可扩、激活不扩。
 #   · 半专家 + 完整模型：仅情感 LSTM-B —— 完整主干永远通电并独占跨轮 (h,c)，
 #     半专家只做单轮小幅修正，门控带上限，反不了客。
 MOE_SCOPE = os.environ.get("ANWAN_MOE_SCOPE", "all")  # "decoder"=旧行为（仅 TF-2 MoE，稠密）| "all"=全域专家化
-# ---- 内容通道 LSTM-A：纯专家池（序列级 Top-k，真 batch 切分）----
-LSTM_A_EXPERTS = 4             # 专家个数
-LSTM_A_TOP_K = 1               # 每条序列只激活 1 个专家（LSTM 激活算力 = 1/4）
-LSTM_A_EXPERT_HIDDEN = 4096    # 单专家隐层；设回 8192 可与旧 ckpt 的 content_proj 完全同形
+# ---- 内容通道：双向专家 Transformer（默认）/ LSTM-A 专家池（回退）----
+CONTENT_TF_LAYERS = 2          # 内容编码器层数（双向自注意力，每 token 看见整段上下文）
+CONTENT_TF_EXPERTS = 4         # 每层 FFN 专家数
+CONTENT_TF_TOP_K = 2           # 每 token 激活专家数
+CONTENT_TF_FF_DIM = 1536       # 单专家 FFN 宽度（与 TF-1 检索同级，手机端标准算子）
+CONTENT_PACK_MAX_SEGS = 4      # 一次前向最多打包的文本段数
+CONTENT_PACK_PROB = 0.4        # LM/SFT 把多段文本打进同一 src 的概率
+LSTM_A_EXPERTS = 4             # LSTM 回退：专家个数
+LSTM_A_TOP_K = 1               # LSTM 回退：每条序列只激活 1 个专家
+LSTM_A_EXPERT_HIDDEN = 4096    # LSTM 回退：单专家隐层
 LSTM_A_LOAD_BALANCE_WEIGHT = 0.01
 LSTM_A_MIN_LOAD = 0.10            # 单个内容专家的最低平均负载（饥饿下界）
 # ---- TF-1 检索编码器：专家化 FFN ----
@@ -265,15 +255,18 @@ EMOTION_VEC_WEIGHT = 0.5       # 向量匹配 loss 权重（MSE 量级 ~O(0.1)�
 EMOTION_VEC_CONT_WEIGHT = 0.8  # 跨轮连续性 loss 权重（只约束低唤醒意图）
 EMOTION_VEC_CONT_AROUSAL_MAX = 0.4  # 唤醒度低于此值的意图才受连续性约束（高唤醒放行跳变）
 EMOTION_VEC_INJECT = 1.0       # 上一轮情感向量注入生成的强度系数
-# ==================== SSM 主干开关 ====================
-ANWAN_BACKBONE = os.environ.get("ANWAN_BACKBONE", "ssm")
+# ==================== 内容主干开关 ====================
+# tf  = 双向专家 Transformer（默认，手机端标准注意力算子）
+# ssm = Mamba2 / 纯 PyTorch S6（需 CUDA 原生核或忍受逐步循环）
+# lstm = LSTM-A 专家池 / 稠密 LSTM
+ANWAN_BACKBONE = os.environ.get("ANWAN_BACKBONE", "tf")
 ANWAN_RETRIEVAL_MODE = os.environ.get("ANWAN_RETRIEVAL_MODE", "full")
 ANWAN_EMO_DIR_NORM = os.environ.get("ANWAN_EMO_DIR_NORM", "std")
 # 记忆检索：同语种相似度加成（方案A软标记的检索侧落地）
 SEARCH_LANG_BONUS = 0.15
 
 # ==================== router 自动分区 ====================
-NUM_MODULES = 4            # LSTM-A 内容 / LSTM-B 情感 / TF-1 检索 / TF-2 生成
+NUM_MODULES = 4            # 内容 Transformer / LSTM-B 情感 / TF-1 检索 / TF-2 生成
 ROUTER_ENTROPY_WEIGHT = 0.1  # 熵正则系数（防路由坍缩；>0 鼓励 soft 组合不垄断）
 ROUTER_ENTROPY_FLOOR = 0.8   # 熵下限：batch 边际路由熵低于此值才开始惩罚
 STAGE = "main"             # "main": 仅对角主通路（内容↔检索、情感↔生成）
@@ -333,7 +326,7 @@ REPLY_MIN_LEN = 2          # 生成结果低于此长度视为无效，走兜底
 
 # ==================== 多轮历史（P1-1） ====================
 HISTORY_TURNS = 4          # respond 保留最近 N 轮显式历史
-HISTORY_MAX_TOKENS = 20    # 历史段注入 src 的最大 token 预算（随 MAX_LEN 扩到 80 同步下调，留空间给记忆和问题）
+HISTORY_MAX_TOKENS = 36    # 历史段注入 src 的最大 token 预算（多段打包后给上下文更多位子）
 MULTI_TURN_PROB = 0.3      # SFT 样本掺入多轮历史的概率
 
 # ---- P1-2 外部长期记忆（事实/日记类） ----
@@ -341,7 +334,7 @@ MEMORY_FILE = os.path.join(MODEL_DIR, "external_memory.json")   # 外部记忆�
 WORDBOOK_FILE = os.path.join(MODEL_DIR, "wordbook.json")         # 生词本（生僻词/外语查询）
 MEMORY_TOP_K = 3          # 检索注入条数
 MEMORY_MIN_SCORE = 0.10   # 注入的相似度下限（过低不注入，避免噪声）
-MEMORY_MAX_TOKENS = 15    # 单条记忆注入 src 的最长 token 数（随 MAX_LEN 扩到 80 同步上调，但受预算限制不能太高）
+MEMORY_MAX_TOKENS = 20    # 单条记忆注入 src 的最长 token 数
 MEMORY_DECAY = 0.995      # 平滑遗忘：每次触发遗忘时全体活跃记忆权重衰减系数
 MEMORY_EXPIRE_WEIGHT = 0.45  # 权重低于此值的低活跃记忆转为"归档"（检索不再返回，可手动恢复）
 MEMORY_MAX_ARCHIVE = 200  # 归档上限（超过则真正物理清理最旧归档，防止 json 无限膨胀）
@@ -355,7 +348,10 @@ try:
 except ValueError:
     EMOTION_DECAY_DAYS = _EMOTION_DECAY_DAYS_DEFAULT
 
-config = types.SimpleNamespace(**{k: globals()[k] for k in ['PROJECT_ROOT', 'BASE_DIR', 'DATA_ROOT', 'MODEL_DIR', 'TOKENIZER_FILE', 'CHECKPOINT_FILE', 'TRAIN_FOLDER', 'LEARNED_PAIRS_FILE', 'LEARNED_PAIRS_NAME', 'MEMORY_FILE', 'WORDBOOK_FILE', 'MEMORY_TOP_K', 'MEMORY_MIN_SCORE', 'MEMORY_MAX_TOKENS', 'MEMORY_DECAY', 'MEMORY_EXPIRE_WEIGHT', 'MEMORY_MAX_ARCHIVE', 'IDF_REBUILD_RATIO', 'EMOTION_STATE_FILE', 'EMOTION_DECAY_DAYS', 'VOCAB_SIZE', 'MAX_LEN', 'SPECIAL_TOKENS', 'BPE_MERGE_CAP', 'EMBED_DIM', 'LSTM_HIDDEN', 'LSTM_LAYERS', 'LSTM_B_HIDDEN', 'EMOTION_DIM', 'NUM_HEADS', 'TRANS_LAYERS', 'DECODER_LAYERS', 'FF_DIM', 'DROPOUT', 'TIE_WEIGHTS', 'INTENTS', 'INTENT_LOSS_WEIGHT', 'EMOTION_STATE_MAX_NORM', 'EMOTION_DIRECTION_WEIGHT', 'EMOTION_AROUSAL_MARGIN', 'EMOTION_AROUSAL', 'EMOTION_VEC_DIM', 'EMOTION_PAD_LABELS', 'EMOTION_PAD_TARGETS', 'EMOTION_VEC_WEIGHT', 'EMOTION_VEC_CONT_WEIGHT', 'EMOTION_VEC_CONT_AROUSAL_MAX', 'EMOTION_VEC_INJECT', 'SEARCH_LANG_BONUS', 'NUM_EXPERTS', 'TOP_K_EXPERTS', 'EXPERT_FF_DIM', 'MOE_LOAD_BALANCE_WEIGHT', 'MOE_SCOPE', 'LSTM_A_EXPERTS', 'LSTM_A_TOP_K', 'LSTM_A_EXPERT_HIDDEN', 'LSTM_A_LOAD_BALANCE_WEIGHT', 'ENC_EXPERTS', 'ENC_TOP_K', 'ENC_EXPERT_FF_DIM', 'ENC_LOAD_BALANCE_WEIGHT', 'EMO_FULL_MODEL', 'EMO_SEMI_EXPERTS', 'EMO_SEMI_TOP_K', 'EMO_SEMI_EXPERT_HIDDEN', 'EMO_SEMI_GATE_INIT', 'EMO_SEMI_GATE_MAX', 'EMO_LOAD_BALANCE_WEIGHT', 'LSTM_A_MIN_LOAD', 'EMO_SEMI_MIN_LOAD', 'MIN_LOAD_WEIGHT', 'NUM_MODULES', 'ROUTER_ENTROPY_WEIGHT', 'ROUTER_ENTROPY_FLOOR', 'STAGE', 'CROSS_GATE_INIT', 'CROSS_GATE_MAX', 'LM_EPOCHS', 'SFT_EPOCHS', 'BATCH_SIZE', 'LR', 'PATIENCE', 'SAVE_EVERY', 'GRAD_CLIP', 'SFT_TRAIN_RATIO', 'AMP_ENABLED', 'AMP_DTYPE', 'CKPT_SAVE_SHADOWS', 'AWIL_ENABLED_IN_TRAIN', 'GRAPH_TOP_CONCEPTS', 'GRAPH_SPREAD_DECAY', 'GRAPH_SPREAD_MIN_RATIO', 'GRAPH_CONCEPT_MAX_DF', 'RETRIEVAL_PROFILES', 'DEFAULT_PROFILE', 'BARRAGE_MIN_LEN', 'TEMPERATURE', 'TOP_P', 'GEN_MAX_LEN', 'REPLY_MIN_LEN', 'HISTORY_TURNS', 'HISTORY_MAX_TOKENS', 'MULTI_TURN_PROB', 'ANWAN_BACKBONE', 'ANWAN_RETRIEVAL_MODE', 'ANWAN_EMO_DIR_NORM']})
+config = types.SimpleNamespace(**{
+    k: v for k, v in list(globals().items())
+    if isinstance(k, str) and k.isupper() and not k.startswith("_")
+})
 
 
 # ==================== 目录体检与自动归位（放错位置检测） ====================
@@ -460,6 +456,7 @@ EOS_IDX = config.SPECIAL_TOKENS["<EOS>"]
 UNK_IDX = config.SPECIAL_TOKENS["<UNK>"]
 USER_IDX = config.SPECIAL_TOKENS["<USER>"]   # 多轮历史：用户发言分隔符（P1-1）
 BOT_IDX = config.SPECIAL_TOKENS["<BOT>"]     # 多轮历史：安晚回复分隔符（P1-1）
+SEP_IDX = config.SPECIAL_TOKENS["<SEP>"]     # 多段文本打包分隔符
 
 
 class BPEAnwanTokenizer:
@@ -846,6 +843,40 @@ def build_src_with_memory(tokenizer, memory_texts, history, question,
     return seq
 
 
+def pack_content_segments(tokenizer, texts, max_len=None, max_segs=None):
+    """把多段文本打进一条 src：<BOS> t1 <SEP> t2 <SEP> t3 ...
+    超出 max_len 时从左截，尽量保住最后一段（当前问题 / 主文本）。"""
+    max_len = max_len or config.MAX_LEN
+    max_segs = max_segs or getattr(config, "CONTENT_PACK_MAX_SEGS", 4)
+    segs = []
+    for t in texts[:max_segs]:
+        ids = _encode_nopad(tokenizer, t)
+        if ids:
+            segs.append(ids)
+    if not segs:
+        return [BOS_IDX]
+    bodies = []
+    for i, ids in enumerate(segs):
+        bodies.append(([] if i == 0 else [SEP_IDX]) + ids)
+    tail = []
+    for body in reversed(bodies):
+        need = len(body) + len(tail)
+        if 1 + need > max_len:
+            room = max_len - 1 - len(tail)
+            if room > 1:
+                tail = body[-room:] + tail
+            break
+        tail = body + tail
+    return ([BOS_IDX] + tail)[:max_len]
+
+
+def _segment_ids_from_src(src, max_segs):
+    """从 <SEP>/<USER> 切段号，供内容通道段 embedding 使用。src: [B, T] -> [B, T]"""
+    markers = (src == SEP_IDX) | (src == USER_IDX)
+    seg = markers.long().cumsum(dim=1)
+    return seg.clamp(max=max(int(max_segs) - 1, 0))
+
+
 def extract_lookup_term(text):
     """从"X是什么意思 / X用英语怎么说 / 翻译成英文的X"这类问句里抽出待查词。
     返回 None 表示抽不出来（让调用方走正常生成路径）。"""
@@ -877,7 +908,7 @@ class WordBook:
     """
     生词本：查生僻词 / 外语词。用户自己维护，模型不强答。
     ------------------------------------------------------------------
-    为什么需要它：240M 从零训练的模型**根本不知道"龘"念 dá、
+    为什么需要它：从零训练的模型**根本不知道"龘"念 dá、
     意思是什么**。让它自由生成 = 编一个错答案给你，而且语气还特别自信。
     与其这样，不如接一个可维护的词典：查到就答，查不到就老实说
     "我不知道"，并告诉用户怎么往词本里加。
@@ -1557,7 +1588,7 @@ class AWIL:
 
     # ---- 模块ID ----
     MOD_BUS = 0x00       # 总线/广播
-    MOD_LSTM_A = 0x01    # 内容通道（LSTM-A）
+    MOD_LSTM_A = 0x01    # 内容通道（双向专家 Transformer / 回退 LSTM-A）
     MOD_LSTM_B = 0x02    # 情感通道（LSTM-B）
     MOD_TF1 = 0x03       # 检索（TF-1）
     MOD_TF2 = 0x04       # 生成（TF-2）
@@ -1794,7 +1825,9 @@ def _packed_lstm(rnn, emb, lengths, hx=None, total_length=None):
     - hx:       (h0, c0) 可选（跨轮情感 state）；非 None 且 B>1 时按 sorted_indices 重排
     返回 (output[B,T,E] 尾部补零, hx_out 已还原 batch 序)
     """
-    packed = pack_padded_sequence(emb, lengths, batch_first=True, enforce_sorted=False)
+    packed = pack_padded_sequence(
+        emb, lengths.detach().cpu(), batch_first=True, enforce_sorted=False
+    )
     if hx is not None:
         si = packed.sorted_indices.to(emb.device)
         # AMP 兼容：autocast 下 emb 可能已是 fp16，hx 必须对齐到相同 dtype，否则 cuDNN 报错
@@ -1914,7 +1947,7 @@ class _MoEDecoderLayer(nn.Module):
 # ==================== v3 半专家化模块（全域专家 + 情感半专家）====================
 # 设计口径（写死在这里，免得日后代码与注释各说各话）：
 #   专家模型（纯 MoE）= 没有常驻主干，每条序列 / 每个 token 只激活 Top-k 个专家。
-#                       用在内容通道 LSTM-A、检索编码器 TF-1、生成解码器 TF-2。
+#                       用在内容通道双向 Transformer、检索编码器 TF-1、生成解码器 TF-2。
 #   半专家 + 完整模型   = 一个始终激活的「完整模型」主干 + Top-k 个小得多的半专家，
 #                       半专家只在主干输出上做门控限幅的小幅修正。
 #                       只用在情感通道 LSTM-B —— 因为情感是唯一跨轮持久化的状态，
@@ -1946,11 +1979,18 @@ def _load_balance_aux(gate_probs, num_experts, aux_weight, min_load=0.0, min_loa
 # 注意：SSM 回退实现精度低于 Mamba2 原生，文件头已注明。
 # 比较报告中会单独标注当前用的是哪种。
 
+_HAS_MAMBA_SSM = False
+_Mamba2Native = None
 try:
-    from mamba_ssm.models.mixer_seq_simple import Mamba2 as _Mamba2Native
+    from mamba_ssm.modules.mamba2 import Mamba2 as _Mamba2Native
     _HAS_MAMBA_SSM = True
 except ImportError:
-    _HAS_MAMBA_SSM = False
+    try:
+        from mamba_ssm.modules.mamba_simple import Mamba as _Mamba2Native
+        _HAS_MAMBA_SSM = True
+    except ImportError:
+        _HAS_MAMBA_SSM = False
+        _Mamba2Native = None
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm as _RMSNorm
@@ -1958,14 +1998,15 @@ except ImportError:
     try:
         from mamba_ssm.ops.triton.rms_norm import RMSNorm as _RMSNorm
     except ImportError:
-        # 简化 RMSNorm 回退
         class _RMSNorm(nn.Module):
             def __init__(self, dim, eps=1e-5):
                 super().__init__()
                 self.eps = eps
                 self.weight = nn.Parameter(torch.ones(dim))
+
             def forward(self, x):
-                return F.normalize(x, dim=-1) * self.weight * (1 + self.eps) / (x.pow(2).mean(-1, keepdim=True) + self.eps).sqrt()
+                rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+                return self.weight * (x / rms)
 
 
 class SequenceBackbone(nn.Module):
@@ -1986,16 +2027,27 @@ class Mamba2Backbone(SequenceBackbone):
         self.d_model = d_model
         self.num_layers = num_layers
         self.layer_idx = layer_idx
-        if _HAS_MAMBA_SSM:
-            # 使用 Mamba2 原生实现
-            self.mixer = _Mamba2Native(
-                d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
-                layer_idx=layer_idx, dropout=dropout,
-            )
+        if _HAS_MAMBA_SSM and _Mamba2Native is not None:
+            try:
+                self.mixer = _Mamba2Native(
+                    d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
+                    layer_idx=layer_idx,
+                )
+            except TypeError:
+                self.mixer = _Mamba2Native(
+                    d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
+                )
         else:
-            # 回退到简化 S6 实现
             self.mixer = _SS6Block(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, dropout=dropout)
         self.norm = _RMSNorm(d_model) if _HAS_MAMBA_SSM else nn.LayerNorm(d_model)
+
+    def _run_mixer(self, x, state=None):
+        if isinstance(self.mixer, _SS6Block):
+            return self.mixer(x, state=state)
+        out = self.mixer(x)
+        if isinstance(out, tuple):
+            return out[0], (out[1] if len(out) > 1 else None)
+        return out, None
 
     def forward(self, x, lengths=None, state=None):
         """x: [B, T, D] -> (out [B, T, D], new_state)
@@ -2003,24 +2055,17 @@ class Mamba2Backbone(SequenceBackbone):
         state: 传递给 mixer 的隐状态（SS6 路径有效；原生 Mamba2 忽略）
         """
         B, T, D = x.size()
-        # 判断 mixer 类型：_SS6Block 支持 state 参数，原生 Mamba2 不支持
-        supports_state = hasattr(self.mixer, 'd_state')  # _SS6Block 有 d_state 属性
         if lengths is not None:
-            mask = torch.arange(T, device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+            lengths_dev = lengths.to(device=x.device)
+            mask = torch.arange(T, device=x.device).unsqueeze(0) < lengths_dev.unsqueeze(1)
             x_masked = x.clone()
             x_masked[~mask] = 0
-            if supports_state:
-                out, new_state = self.mixer(x_masked, state=state)
-            else:
-                out, new_state = self.mixer(x_masked)
+            out, new_state = self._run_mixer(x_masked, state=state)
             out = out * mask.unsqueeze(-1)
         else:
-            if supports_state:
-                out, new_state = self.mixer(x, state=state)
-            else:
-                out, new_state = self.mixer(x)
-        out = self.norm(out + x)  # residual connection
-        return out, new_state  # 返回状态供跨轮持久化
+            out, new_state = self._run_mixer(x, state=state)
+        out = self.norm(out + x)
+        return out, new_state
 
     def state_to_dict(self):
         return None
@@ -2039,10 +2084,11 @@ class _SS6Block(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
+        self.d_conv = d_conv
         self.d_inner = d_model * expand
         self.in_proj = nn.Linear(d_model, self.d_inner * 2)
         self.conv1d = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner,
-                                kernel_size=d_conv, padding=d_conv - 1, groups=self.d_inner)
+                                kernel_size=d_conv, padding=0, groups=self.d_inner)
         # SSM 参数
         self.dt_proj = nn.Linear(self.d_inner, self.d_inner)
         self.dA = nn.Parameter(torch.randn(self.d_inner, d_state))
@@ -2064,11 +2110,11 @@ class _SS6Block(nn.Module):
         xy = self.in_proj(x)  # [B, T, d_inner*2]
         x, gate = xy.chunk(2, dim=-1)
         # 1D 卷积（因果）
-        x = x.transpose(1, 2)  # [B, d_inner, T]
-        x = F.pad(x, (self.conv1d.padding[0], 0))
+        x = x.transpose(1, 2)
+        x = F.pad(x, (self.d_conv - 1, 0))
         x = self.conv1d(x)
         x = F.silu(x)
-        x = x.transpose(1, 2)  # [B, T, d_inner]
+        x = x.transpose(1, 2)
 
         # SSM 逐时间步递推
         if state is None:
@@ -2096,11 +2142,9 @@ class _SS6Block(nn.Module):
             y_t = (C_t.unsqueeze(1) * h).sum(dim=-1)              # [B, d_inner]
             outputs.append(y_t.unsqueeze(1))
 
-        x_out = torch.cat(outputs, dim=1)  # [B, T, d_inner]
-        x_out = self.out_proj(x_out)  # [B, T, D]
-        # Residual + LayerNorm
-        out = self.norm(x_out + x_orig)
-        return out, h
+        x_out = torch.cat(outputs, dim=1) * F.silu(gate)
+        x_out = self.out_proj(x_out)
+        return x_out, h
 
     def state_to_dict(self):
         return None
@@ -2150,7 +2194,8 @@ class _ExpertLSTMPool(nn.Module):
             # 同一序列在 k 个槽位里命中同一专家时权重相加（正常 top-k 不会重复）
             w_e = (topk_w[rows] * hit[rows]).sum(dim=1, keepdim=True)   # [n, 1]
             o, _ = _packed_lstm(
-                self.experts[e_id], x[rows], lengths[rows], total_length=total_length
+                self.experts[e_id], x[rows], lengths.detach().cpu()[rows.detach().cpu()],
+                total_length=total_length
             )
             out.index_add_(0, rows, w_e.unsqueeze(1) * o)
         aux = _load_balance_aux(probs, self.num_experts, self.aux_weight,
@@ -2208,7 +2253,8 @@ class _SemiExpertLSTM(nn.Module):
                 continue
             w_e = (topk_w[rows] * hit[rows]).sum(dim=1, keepdim=True)
             o, _ = _packed_lstm(
-                self.experts[e_id], x[rows], lengths[rows], total_length=total_length
+                self.experts[e_id], x[rows], lengths.detach().cpu()[rows.detach().cpu()],
+                total_length=total_length
             )
             mix.index_add_(0, rows, w_e.unsqueeze(1) * self.out_projs[e_id](o))
         aux = _load_balance_aux(probs, self.num_experts, self.aux_weight,
@@ -2260,6 +2306,31 @@ class _MoEEncoder(nn.Module):
         return x, aux_total
 
 
+class ContentMoEBackbone(nn.Module):
+    """内容通道：双向专家 Transformer。每 token 看见整段上下文（含多段打包），
+    FFN 走 Top-k 专家，注意力是标准 MultiheadAttention（手机端可用）。"""
+
+    def __init__(self, d_model, nhead, num_layers=2, num_experts=4, top_k=2,
+                 expert_ff_dim=1536, dropout=0.1, max_segs=4):
+        super().__init__()
+        self.max_segs = max_segs
+        self.seg_embed = nn.Embedding(max_segs, d_model)
+        self.pos = PositionalEncoding(d_model, dropout=0.0)
+        self.encoder = _MoEEncoder(
+            d_model=d_model, nhead=nhead, num_layers=num_layers,
+            num_experts=num_experts, top_k=top_k,
+            expert_ff_dim=expert_ff_dim, dropout=dropout,
+        )
+
+    def forward(self, x, src=None, pad_mask=None):
+        """x: [B, T, D] -> (out [B, T, D], aux)"""
+        if src is not None:
+            seg_ids = _segment_ids_from_src(src, self.max_segs)
+            x = x + self.seg_embed(seg_ids)
+        x = self.pos(x)
+        return self.encoder(x, src_key_padding_mask=pad_mask)
+
+
 class PositionalEncoding(nn.Module):
     """正弦位置编码（无参数，运行时按实际序列长度动态计算，无固定上限）"""
 
@@ -2272,16 +2343,19 @@ class PositionalEncoding(nn.Module):
         # x: [B, T, D]
         T = x.size(1)
         position = torch.arange(0, T, dtype=torch.float, device=x.device).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, self.d_model, 2).float().to(x.device) * (-math.log(10000.0) / self.d_model))
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=x.device).float()
+            * (-math.log(10000.0) / self.d_model)
+        )
         pe = torch.zeros(1, T, self.d_model, device=x.device)
         pe[:, :, 0::2] = torch.sin(position * div_term)
-        pe[:, :, 1::2] = torch.cos(position * div_term)
+        pe[:, :, 1::2] = torch.cos(position * div_term[: pe.size(-1) // 2])
         return self.dropout(x + pe)
 
 
 class UnifiedAnwanModel(nn.Module):
     """
-    一体化统一模型：LSTM-A(内容) / LSTM-B(情感·跨轮) / TF-1(检索) / TF-2(生成)
+    一体化统一模型：内容通道(双向专家 Transformer) / LSTM-B(情感·跨轮) / TF-1(检索) / TF-2(生成)
     同一实例四组参数块，共享 embedding + 输出投影；中央 soft router 自动分区。
     """
 
@@ -2298,7 +2372,7 @@ class UnifiedAnwanModel(nn.Module):
         ff_dim=6144,
         emotion_vec_dim=3,
         dropout=0.1,
-        num_intents=12,
+        num_intents=14,
         tie_weights=True,
         cross_gate_init=0.1,
         entropy_floor=0.8,
@@ -2316,32 +2390,35 @@ class UnifiedAnwanModel(nn.Module):
         # ---- 共享 embedding（四组模块共用同一张表）----
         self.shared_embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=PAD_IDX)
 
-        # ---- LSTM-A：内容通道（无状态 / 单轮）----
-        # MOE_SCOPE="all" 时整条内容通道改为纯专家池：序列级 Top-k 路由 + 真 batch
-        # 切分 dispatch，激活算力只有稠密等价的 Top-k/专家数。旧行为（稠密）保留在
-        # MOE_SCOPE="decoder" 分支，方便做消融对照。
+        # ---- 内容通道（无状态 / 单轮，可一次吃多段文本）----
+        # 默认 tf：双向专家 Transformer（标准注意力，手机端可用）。
+        # ssm / lstm 仍作回退；MOE_SCOPE="decoder" 时走稠密 LSTM。
         self.lstm_a_hidden = lstm_hidden
         self.moe_scope = getattr(config, "MOE_SCOPE", "decoder")
-        # ---- LSTM-A / SSM：内容通道（无状态 / 单轮）----
-        # ANWAN_BACKBONE=ssm 时用 Mamba2 主干替换 LSTM-A；lstm 时保持原行为
         self.lstm_a_pool = None
         self.lstm_a = None
         self.ssm_backbone = None
-        backbone_type = getattr(config, "ANWAN_BACKBONE", "ssm")
-        if backbone_type == "ssm" and self.moe_scope == "all":
-            # SSM 主干：用 Mamba2 替换 LSTM-A 专家池
+        self.content_tf = None
+        backbone_type = getattr(config, "ANWAN_BACKBONE", "tf")
+        if backbone_type == "tf" or (backbone_type not in ("ssm", "lstm") and self.moe_scope == "all"):
+            self.content_tf = ContentMoEBackbone(
+                d_model=embed_dim, nhead=num_heads,
+                num_layers=getattr(config, "CONTENT_TF_LAYERS", 2),
+                num_experts=getattr(config, "CONTENT_TF_EXPERTS", 4),
+                top_k=getattr(config, "CONTENT_TF_TOP_K", 2),
+                expert_ff_dim=getattr(config, "CONTENT_TF_FF_DIM", 1536),
+                dropout=dropout,
+                max_segs=getattr(config, "CONTENT_PACK_MAX_SEGS", 4),
+            )
+            content_dim = embed_dim
+        elif backbone_type == "ssm" and self.moe_scope == "all":
             ssm_d_model = getattr(config, "EMBED_DIM", 1536)
-            ssm_d_state = 16
-            ssm_expand = 2
             self.ssm_backbone = Mamba2Backbone(
-                d_model=ssm_d_model, d_state=ssm_d_state, d_conv=4, expand=ssm_expand,
+                d_model=ssm_d_model, d_state=16, d_conv=4, expand=2,
                 num_layers=1, dropout=config.DROPOUT, layer_idx=0,
             )
-            # SSM 输出维度(=EMBED_DIM) -> LSTM-B hidden 维度的投影（用于情感通道）
-            self.ssm_emotion_proj = nn.Linear(ssm_d_model, lstm_b_hidden)
             content_dim = ssm_d_model
         elif self.moe_scope == "all":
-            # LSTM 专家池（回退路径）
             self.lstm_a_pool = _ExpertLSTMPool(
                 embed_dim, getattr(config, "LSTM_A_EXPERT_HIDDEN", lstm_hidden),
                 num_experts=config.LSTM_A_EXPERTS, top_k=config.LSTM_A_TOP_K,
@@ -2356,7 +2433,7 @@ class UnifiedAnwanModel(nn.Module):
             content_dim = lstm_hidden
 
         # ---- LSTM-B：情感通道（有状态 / 跨轮 / emotion_dim）----
-        # 240M 规格：emb_proj(848→512) + LSTM(512→2048) + out_proj(2048→512)
+        # 800M 规格：emb_proj(1536→512) + LSTM(512→3600) + out_proj(3600→512)
         self.emb_proj = nn.Linear(embed_dim, emotion_dim)
         self.lstm_b = nn.LSTM(
             emotion_dim, lstm_b_hidden, num_layers=1, batch_first=True, bidirectional=False
@@ -2445,14 +2522,14 @@ class UnifiedAnwanModel(nn.Module):
         # ---- 中央自动分区 router（soft 门控，非 top-k）----
         # 四个模块各出一个分量表示，router 决定 softmax 组合权重（分区由训练自动学出）
         self.module_projs = nn.ModuleList([
-            nn.Linear(content_dim, embed_dim),   # LSTM-A 内容（专家化后维度随专家隐层）
+            nn.Linear(content_dim, embed_dim),   # 内容通道（tf 时即 embed_dim）
             nn.Linear(emotion_dim, embed_dim),   # LSTM-B 情感
             nn.Linear(embed_dim, embed_dim),     # TF-1 检索
             nn.Linear(embed_dim, embed_dim),     # TF-2 生成
         ])
         self.router_net = nn.Linear(embed_dim * 4, 4)  # softmax 组合权重
 
-        # ---- 一体化意图头（12 意图多任务监督，train 可选）----
+        # ---- 一体化意图头（14 意图多任务监督，train 可选）----
         self.intent_head = nn.Linear(embed_dim, num_intents)
 
         self.dropout = nn.Dropout(dropout)
@@ -2592,9 +2669,9 @@ class UnifiedAnwanModel(nn.Module):
 
         src_emb = self.shared_embedding(src)          # [B, T, E]
 
-        # ---- LSTM-A：内容通道（无状态，仅有效 token 演化）----
+        # ---- 内容通道（双向专家 Transformer / SSM / LSTM；可一次吃多段）----
         content_out, aux_content, usage_content = self._encode_content(
-            src_emb, lengths, T
+            src_emb, lengths, T, src=src
         )                                             # [B, T, content_dim]
 
         # ---- LSTM-B：情感通道（有状态，跨轮；仅有效 token 演化）----
@@ -2896,7 +2973,7 @@ class UnifiedAnwanModel(nn.Module):
     ):
         """
         自回归生成：
-        - 编码一次（LSTM-A/B + TF-1），得到 mem 与跨轮情感 state（返回给推理引擎）
+        - 编码一次（内容通道 + LSTM-B + TF-1），得到 mem 与跨轮情感 state（返回给推理引擎）
         - 解码循环：每个时间步对已生成前缀做一次 TF-2，取末位 logits 采样
         - strategy: "greedy" | "top_k" | "nucleus"
         返回 (token_ids, new_state, router_weights, router_entropy, emotion_vec)
@@ -2908,7 +2985,7 @@ class UnifiedAnwanModel(nn.Module):
         lengths = _effective_lengths(src)
 
         src_emb = self.shared_embedding(src)
-        content_out, _, _ = self._encode_content(src_emb, lengths, T)
+        content_out, _, _ = self._encode_content(src_emb, lengths, T, src=src)
         if emotion_state is not None:
             h0, c0 = emotion_state
         else:
@@ -3005,10 +3082,14 @@ class UnifiedAnwanModel(nn.Module):
         return generated, new_state, router_weights, router_entropy, emotion_vec
 
     # ------------------------------------------------ v3 通道编码 helper ----
-    def _encode_content(self, src_emb, lengths, T):
-        """内容通道：SSM 主干 / 纯专家池（Top-k 稀疏）/ 稠密回退 -> (out, aux|None, usage|None)"""
-        backbone_type = getattr(config, "ANWAN_BACKBONE", "ssm")
-        # SSM 主干路径：不使用 _packed_lstm，用 SSM 的 mask 机制处理 padding
+    def _encode_content(self, src_emb, lengths, T, src=None):
+        """内容通道：双向专家 Transformer / SSM / LSTM 专家池 / 稠密回退
+        -> (out, aux|None, usage|None)"""
+        if getattr(self, "content_tf", None) is not None:
+            pad_mask = _pad_mask(src, src_emb.device) if src is not None else None
+            out, aux = self.content_tf(src_emb, src=src, pad_mask=pad_mask)
+            return out, aux, None
+        backbone_type = getattr(config, "ANWAN_BACKBONE", "tf")
         if backbone_type == "ssm" and self.ssm_backbone is not None:
             out, _ = self.ssm_backbone(src_emb, lengths=lengths)
             return out, None, None
@@ -3018,34 +3099,15 @@ class UnifiedAnwanModel(nn.Module):
         return out, None, None
 
     def _encode_emotion(self, emo_in, lengths, T, h0, c0):
-        """情感通道：SSM 主干 / 完整模型（始终激活，独占跨轮 (h,c)）+ 半专家限幅修正。
+        """情感通道：完整 LSTM-B（始终激活，独占跨轮 (h,c)）+ 半专家限幅修正。
         返回 (emotion_out [B,T,emotion_dim], (hB,cB), aux|None, usage|None)
         """
-        backbone_type = getattr(config, "ANWAN_BACKBONE", "ssm")
-        if backbone_type == "ssm" and self.ssm_backbone is not None:
-            # SSM 路径：情感通道用 SSM 主干 + 状态递推
-            emo_out_seq, ssm_state = self.ssm_backbone(emo_in, lengths=lengths, state=None)
-            # emo_out_seq: [B, T, ssm_d_model] -> 投影到 lstm_b_hidden 维度
-            emo_out_projected = self.ssm_emotion_proj(emo_out_seq)  # [B, T, lstm_b_hidden]
-            # 取最后有效位置作为跨轮状态
-            hB = emo_out_projected[:, -1:, :]  # [B, 1, lstm_b_hidden]
-            cB = hB  # SSM 简化：用同一值模拟 c 状态
-            aux = usage = None
-            if getattr(self, "lstm_b_semi", None) is not None:
-                mix, aux, usage = self.lstm_b_semi(emo_in, lengths, total_length=T)
-                gate = self.emo_semi_gate.clamp(max=self.emo_semi_gate_max)
-                hB = hB + gate * mix[:, -1:, :]
-            # emo_out_projected 已经是 lstm_b_hidden 维，经 emo_out_proj 投影到 emotion_dim
-            emotion_out = self.emo_out_proj(emo_out_projected)  # [B, T, emotion_dim]
-            return emotion_out, (hB, cB), aux, usage
-        # LSTM 路径（回退）
         full_out, (hB, cB) = _packed_lstm(
             self.lstm_b, emo_in, lengths, hx=(h0, c0), total_length=T
         )
         aux = usage = None
         if getattr(self, "lstm_b_semi", None) is not None:
             mix, aux, usage = self.lstm_b_semi(emo_in, lengths, total_length=T)
-            # 门控限幅：半专家最多贡献 gate_max 量级，完整模型永远是主导项
             gate = self.emo_semi_gate.clamp(max=self.emo_semi_gate_max)
             full_out = full_out + gate * mix
         return self.emo_out_proj(full_out), (hB, cB), aux, usage
@@ -3059,8 +3121,10 @@ class UnifiedAnwanModel(nn.Module):
     def expert_usage(self):
         """各专家池的激活分布（体检/防坍缩监控用，全部 detach）。"""
         info = {}
-        backbone_type = getattr(config, "ANWAN_BACKBONE", "ssm")
-        if backbone_type == "ssm":
+        backbone_type = getattr(config, "ANWAN_BACKBONE", "tf")
+        if getattr(self, "content_tf", None) is not None:
+            info["backbone"] = "tf(bidirectional-MoE)"
+        elif backbone_type == "ssm":
             info["backbone"] = "ssm(Mamba2)" if _HAS_MAMBA_SSM else "ssm(S6-fallback)"
         else:
             info["backbone"] = "lstm"
@@ -3072,6 +3136,13 @@ class UnifiedAnwanModel(nn.Module):
             info["lstm_b_semi"] = [round(v, 4) for v in semi.last_usage.detach().cpu().tolist()]
             info["lstm_b_gate"] = round(
                 float(self.emo_semi_gate.detach().clamp(max=self.emo_semi_gate_max)), 4)
+        ctf = getattr(self, "content_tf", None)
+        if ctf is not None:
+            info["content_tf"] = [
+                None if l.moe_ffn.last_usage is None
+                else [round(v, 4) for v in l.moe_ffn.last_usage.detach().cpu().tolist()]
+                for l in ctf.encoder.layers
+            ]
         if isinstance(self.tf1, _MoEEncoder):
             info["tf1"] = [
                 None if l.moe_ffn.last_usage is None
@@ -3102,7 +3173,7 @@ class UnifiedAnwanModel(nn.Module):
 
 class UnifiedIntentLabeler:
     """
-    一体化意图标注（规则版）：从问题文本标出 12 意图之一
+    一体化意图标注（规则版）：从问题文本标出 14 意图之一
     与旧版 IntentAutoLabeler 规则对齐；供训练流程自动打标签（无需外部意图网络）
     """
 
@@ -3681,15 +3752,19 @@ class DataPipeline:
             srcs, tgt_ins, tgt_outs, intents = [], [], [], []
             for q, a in chunk:
                 use_history = rng.random() < config.MULTI_TURN_PROB and len(corpus) > 1
+                pack_prob = getattr(config, "CONTENT_PACK_PROB", 0.0)
                 if use_history:
-                    # 多轮样本：随机抽 1~HISTORY_TURNS 轮历史拼入 src（当前问句保留在末尾）
                     n_prev = rng.randint(1, min(config.HISTORY_TURNS, len(corpus) - 1))
                     history = rng.sample(corpus, n_prev)
                     src_idx = build_multi_turn_src(
                         self.tokenizer, history, q,
                         max_len=self.max_len, history_turns=None)
+                elif pack_prob and rng.random() < pack_prob and len(self.texts) > 1:
+                    n_ctx = rng.randint(1, max(1, getattr(config, "CONTENT_PACK_MAX_SEGS", 4) - 1))
+                    ctx = rng.sample(self.texts, min(n_ctx, len(self.texts)))
+                    src_idx = pack_content_segments(
+                        self.tokenizer, list(ctx) + [q], max_len=self.max_len)
                 else:
-                    # 单轮基准样本（原逻辑）
                     q_ids = self.tokenizer.encode(q, max_len=self.max_len - 1)
                     src_idx = [config.SPECIAL_TOKENS["<BOS>"]] + q_ids
                 a_ids = self.tokenizer.encode(a, max_len=self.max_len - 1)
@@ -3722,9 +3797,17 @@ class DataPipeline:
         for i in range(0, len(texts), batch_size):
             chunk = texts[i : i + batch_size]
             srcs, tgt_ins, tgt_outs = [], [], []
+            pack_prob = getattr(config, "CONTENT_PACK_PROB", 0.0)
+            max_segs = getattr(config, "CONTENT_PACK_MAX_SEGS", 4)
             for t in chunk:
                 t_ids = self.tokenizer.encode(t, max_len=self.max_len - 1)
-                src_idx = [config.SPECIAL_TOKENS["<BOS>"]] + t_ids
+                if pack_prob and rng.random() < pack_prob and len(texts) > 1:
+                    n_ctx = rng.randint(1, max(1, max_segs - 1))
+                    extra = rng.sample(texts, min(n_ctx, len(texts)))
+                    src_idx = pack_content_segments(
+                        self.tokenizer, list(extra) + [t], max_len=self.max_len)
+                else:
+                    src_idx = [config.SPECIAL_TOKENS["<BOS>"]] + t_ids
                 tgt_in = [config.SPECIAL_TOKENS["<BOS>"]] + t_ids
                 tgt_out = t_ids + [config.SPECIAL_TOKENS["<EOS>"]]
                 srcs.append(src_idx[: self.max_len])
@@ -4208,10 +4291,13 @@ class UnifiedTrainer:
             # （索引不越界、不报错，但取到的是别的样本的状态）。末批通常不满，
             # 尺寸不匹配时直接重置，宁可少串一串也不能用错状态。
             B_now = batch["src"].size(0)
-            if emo_state is not None and emo_state[0].size(1) != B_now:
-                emo_state = None
-                prev_emotion_vec = None
-                emo_resets += 1
+            if emo_state is not None:
+                h_chk = emo_state[0]
+                batch_dim = h_chk.size(1) if h_chk.dim() >= 3 else h_chk.size(0)
+                if batch_dim != B_now:
+                    emo_state = None
+                    prev_emotion_vec = None
+                    emo_resets += 1
             if prev_emotion_vec is not None and prev_emotion_vec.size(0) != B_now:
                 prev_emotion_vec = None        # 向量也跨 batch，尺寸不匹配同样重置
             # 数值护栏：LSTM 状态在长链上可能发散，炸了就重置而不是毒化整个 epoch
@@ -4448,7 +4534,7 @@ class UnifiedTrainer:
     # ---------------- checkpoint 管理 ----------------
     def save_checkpoint(self, epoch, stage, val_loss=None):
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
-        # 体积诊断：240M 参数下 model/ema/best/optimizer 四份合计可达 ~4.8GB，
+        # 体积诊断：800M 参数下 model/ema/best/optimizer 四份合计可达约 12GB，
         # Orin Nano 8G 机器上保存本身就可能失败。打印实际大小 + 提供瘦身开关。
         n_params = sum(p.numel() for p in self.model.parameters())
         est_gb = n_params * 4 * 4 / (1024 ** 3)   # 粗估：4 份 fp32 副本
@@ -4604,7 +4690,7 @@ class UnifiedTrainer:
             print("  锁定状态: 未固化（数据不足）")
         print("  意图-模块映射:")
         for intent, info in report["intents"].items():
-            mod_name = ["内容LSTM-A", "情感LSTM-B", "检索TF-1", "生成TF-2"][info["top_module"]]
+            mod_name = ["内容TF", "情感LSTM-B", "检索TF-1", "生成TF-2"][info["top_module"]]
             print(f"    {intent:12s} -> {mod_name} (权重={info['top_weight']:.3f})")
         print("=" * 56)
         return report
@@ -4613,7 +4699,7 @@ class UnifiedTrainer:
 # ==================== 推理引擎（原 anwan/inference.py） ====================
 
 # 模块名（router 输出 4 维权重对应说明）
-MODULE_NAMES = ["内容LSTM-A", "情感LSTM-B", "检索TF-1", "生成TF-2"]
+MODULE_NAMES = ["内容TF", "情感LSTM-B", "检索TF-1", "生成TF-2"]
 
 # 慢轨相似度阈值：低于此不采用（保质量底线）
 SIM_THRESHOLD = 0.62
@@ -4800,12 +4886,9 @@ class InferenceEngine:
         m = re.search(r"(.)\1{11,}", text)
         if m:
             return False
-        # 中文占比过低（乱码混标点，如 "()))..(..!喵)`.(!"）：安晚以中文为主，
-        # 长度 >= 3 时若 CJK 字符占比 < 40% 视为无效生成，走兜底
-        if len(text) >= 3:
-            cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-            if cjk / len(text) < 0.4:
-                return False
+        letters = sum(1 for ch in text if ch.isalpha() or ("\u4e00" <= ch <= "\u9fff"))
+        if len(text) >= 3 and letters / len(text) < 0.4:
+            return False
         return True
 
     # ---------------------------------------------------------- 兜底词库 --
@@ -4952,7 +5035,7 @@ class InferenceEngine:
                 return text, self._finalize_meta(meta)
 
         # 1.5) 生词本：生僻词/外语查询。放在模型生成之前 ——
-        # 让 240M 去自由生成"龘"的意思 = 编一个自信的错答案。
+        # 让从零训练的模型去自由生成"龘"的意思 = 编一个自信的错答案。
         # 查到就直接答；查不到也要给可执行的引导（怎么往词本里加）。
         # 路由条件：意图判定为查词，**或**该词已经在生词本里（用户教过）。
         # 后者很重要：单个拉丁词（hello / serendipity）歧义太大，不能靠意图
@@ -5925,9 +6008,17 @@ def cmd_moe_report(args):
     active = model.count_active_parameters()
     print("\n  === v3 专家化体检 ===")
     print(f"  MOE_SCOPE          : {model.moe_scope}")
-    print(f"  内容 LSTM-A        : 纯专家 {config.LSTM_A_EXPERTS} 个 × 隐层 {config.LSTM_A_EXPERT_HIDDEN}"
-          f"，Top-{config.LSTM_A_TOP_K}" if model.lstm_a_pool else
-          "  内容 LSTM-A        : 稠密（旧行为）")
+    if getattr(model, "content_tf", None) is not None:
+        print(f"  内容通道           : 双向专家 Transformer {config.CONTENT_TF_LAYERS} 层 × "
+              f"{config.CONTENT_TF_EXPERTS} 专家，Top-{config.CONTENT_TF_TOP_K}"
+              f"（可一次打包 {config.CONTENT_PACK_MAX_SEGS} 段）")
+    elif model.lstm_a_pool:
+        print(f"  内容 LSTM-A        : 纯专家 {config.LSTM_A_EXPERTS} 个 × 隐层 {config.LSTM_A_EXPERT_HIDDEN}"
+              f"，Top-{config.LSTM_A_TOP_K}")
+    elif getattr(model, "ssm_backbone", None) is not None:
+        print("  内容通道           : SSM（Mamba2 / S6 回退）")
+    else:
+        print("  内容 LSTM-A        : 稠密（旧行为）")
     print(f"  检索 TF-1          : 专家 FFN {config.ENC_EXPERTS} 个，Top-{config.ENC_TOP_K}"
           if isinstance(model.tf1, _MoEEncoder) else "  检索 TF-1          : 稠密 FFN（旧行为）")
     print(f"  生成 TF-2          : 专家 FFN {config.NUM_EXPERTS} 个，Top-{config.TOP_K_EXPERTS}")
@@ -5977,7 +6068,7 @@ def cmd_calibrate_emotion(args):
     max_samples = getattr(args, "max_samples", 200)
     
     print("[标定] 开始收集 SSM 状态统计...")
-    print(f"  设备: {device}, 主干: {getattr(config, 'ANWAN_BACKBONE', 'ssm')}")
+    print(f"  设备: {device}, 主干: {getattr(config, 'ANWAN_BACKBONE', 'tf')}")
     
     with torch.no_grad():
         for batch in pipeline.sft_batches(min(config.BATCH_SIZE, 8), device):
@@ -5991,18 +6082,12 @@ def cmd_calibrate_emotion(args):
             src_emb = model.shared_embedding(src)
             emo_in = model.emb_proj(src_emb)
             
-            # 获取当前情感状态
-            backbone_type = getattr(config, "ANWAN_BACKBONE", "ssm")
-            if backbone_type == "ssm" and model.ssm_backbone is not None:
-                emo_out, _ = model.ssm_backbone(emo_in, lengths=lengths)
-                h_current = emo_out[:, -1, :]  # 取最后位置
-            else:
-                h0 = torch.zeros(1, B, model.lstm_b_hidden, device=device)
-                c0 = torch.zeros(1, B, model.lstm_b_hidden, device=device)
-                full_out, (hB, cB) = _packed_lstm(
-                    model.lstm_b, emo_in, lengths, hx=(h0, c0), total_length=src.size(1)
-                )
-                h_current = full_out[:, -1, :]
+            h0 = torch.zeros(1, B, model.lstm_b_hidden, device=device)
+            c0 = torch.zeros(1, B, model.lstm_b_hidden, device=device)
+            full_out, (hB, cB) = _packed_lstm(
+                model.lstm_b, emo_in, lengths, hx=(h0, c0), total_length=src.size(1)
+            )
+            h_current = hB.squeeze(0)
             
             # 统计范数
             norms = h_current.norm(dim=-1).cpu().tolist()
@@ -6039,10 +6124,9 @@ def cmd_calibrate_emotion(args):
     p99_norm = float(np.percentile(state_norms_arr, 99))
     median_delta = float(np.median(delta_norms_arr))
     
-    # 计算高低唤醒分离度
+    high_mean = float(np.mean(arousal_high)) if arousal_high else float("nan")
+    low_mean = float(np.mean(arousal_low)) if arousal_low else float("nan")
     if arousal_high and arousal_low:
-        high_mean = float(np.mean(arousal_high))
-        low_mean = float(np.mean(arousal_low))
         rel_sep = (high_mean - low_mean) / (high_mean + low_mean + 1e-6)
     else:
         rel_sep = 0.0
@@ -6066,9 +6150,10 @@ def cmd_calibrate_emotion(args):
           f"std={state_norms_arr.std():.2f})")
     print(f"    说明: 状态范数超过此值时触发重置，建议设为P99以上")
     print()
+    high_txt = f"{high_mean:.2f}" if arousal_high else "N/A"
+    low_txt = f"{low_mean:.2f}" if arousal_low else "N/A"
     print(f"  EMOTION_AROUSAL_MARGIN  建议值: {rel_sep:.3f}")
-    print(f"    (高唤醒均值={high_mean:.2f} if arousal_high else 'N/A', "
-          f"低唤醒均值={low_mean:.2f} if arousal_low else 'N/A')")
+    print(f"    (高唤醒均值={high_txt}, 低唤醒均值={low_txt})")
     print(f"    说明: (高唤醒-低唤醒)/(高唤醒+低唤醒) 的中位数分离度")
     print()
     print(f"  EMOTION_DECAY_DAYS      建议值: {estimated_decay_days:.1f}")
@@ -6202,7 +6287,7 @@ def cmd_baseline(args):
                             folder_path=getattr(args, "folder", None))
     
     baseline_dir = os.path.join(config.MODEL_DIR, "baseline.json")
-    results = {"seed": seed, "backbone": getattr(config, "ANWAN_BACKBONE", "ssm"),
+    results = {"seed": seed, "backbone": getattr(config, "ANWAN_BACKBONE", "tf"),
                "retrieval_mode": getattr(config, "ANWAN_RETRIEVAL_MODE", "full"),
                "steps": []}
     
@@ -6288,7 +6373,7 @@ def cmd_compare(args):
     
     # 收集当前指标
     model.eval()
-    current_metrics = {"backbone": getattr(config, "ANWAN_BACKBONE", "ssm"),
+    current_metrics = {"backbone": getattr(config, "ANWAN_BACKBONE", "tf"),
                        "retrieval_mode": getattr(config, "ANWAN_RETRIEVAL_MODE", "full")}
     
     # 跑验证集计算 loss（与 train_stage 一致的切分逻辑）
@@ -6312,7 +6397,7 @@ def cmd_compare(args):
             loss = F.cross_entropy(
                 out["logits"].reshape(-1, out["logits"].size(-1)),
                 batch["tgt_out"].reshape(-1),
-                ignore_index=0
+                ignore_index=PAD_IDX
             )
             total_loss += float(loss)
     
