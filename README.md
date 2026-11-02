@@ -1,6 +1,6 @@
 # Anwan-v2
 
-安晚一体化统一模型 v2：单文件自包含（训练 + 对话）。规格约 800M 参数。默认内容通道为双向专家 Transformer（标准注意力，手机端可用），一次可打包多段文本；情感通道始终走 LSTM-B 以保持跨轮 `(h, c)`。SSM / LSTM-A 仍可经环境变量回退。
+安晚一体化统一模型 v2：单文件自包含（训练 + 对话）。规格约 800M 参数。默认内容通道为双向专家 Transformer（标准注意力，手机端可用），一次可打包多段文本；情感通道始终走 LSTM-B 以保持跨轮 `(h, c)`。中央路由前置：看输入摘要、意图、上一轮 PAD 后决定跑哪些通道，情感与生成永不跳过。SSM / LSTM-A 仍可经环境变量回退。
 
 ## 环境
 
@@ -65,10 +65,11 @@ python a12.py chat
 ## 规格（不降配）
 
 - Embedding 1536；内容通道默认 2 层双向 MoE Transformer（4 专家 Top-2，FFN 1536）
-- 一次最多打包 4 段文本（`<SEP>` 分隔 + 段 embedding）；LM/SFT 以 0.4 概率掺入
+- 一次最多打包 6 段文本（`<SEP>` 分隔 + 段 embedding）；LM/SFT 以 0.4 概率掺入
 - LSTM-B hidden 3600；情感 512 维 + PAD 三维（愉悦 / 唤醒 / 支配）
 - TF-1：5 层；TF-2：4 层 MoE decoder（4 专家 Top-2）
-- 词表 32000，输入 `MAX_LEN=80`，生成 `GEN_MAX_LEN=1024`
+- 前置通用路由：输入摘要 + 意图 embedding + PAD → 4 通道权重；推理时内容/检索低于 `ROUTER_SKIP_THRESHOLD=0.12` 可跳过；按意图锁定 top-2（情感+生成强制常驻）
+- 词表 32000；输入 `MAX_LEN=256`、训练/生成 `TGT_MAX_LEN=GEN_MAX_LEN=256`（2+5+4 层能稳住的读写上限）；历史 6 轮 / 120 token，记忆单条 48 token
 - 意图 14 类（含 `lang_learning` / `rare_word`）
 - 回退：`ANWAN_BACKBONE=ssm` 或 `lstm`（LSTM-A hidden 8192 / 专家隐层 4096）
 

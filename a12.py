@@ -121,7 +121,7 @@ LEARNED_PAIRS_NAME = os.path.basename(LEARNED_PAIRS_FILE)              # 落盘�
 
 # ==================== 分词器 ====================
 VOCAB_SIZE = 32000          # 词表大小（方案A(语种子词表)+方案B(全局扩表)融合基线：
-MAX_LEN = 80               # 输入最长 token 数（Orin 8G + AMP 后可安全撑到 80，有余量再往上加）
+MAX_LEN = 256              # 输入最长 token 数（2 层双向内容编码 + 5 层检索，800M 能稳住的读力上限）
 SPECIAL_TOKENS = {
     "<PAD>": 0, "<BOS>": 1, "<EOS>": 2, "<UNK>": 3,
     "<SEP>": 4, "<MASK>": 5, "<USER>": 6, "<BOT>": 7,
@@ -210,7 +210,7 @@ CONTENT_TF_LAYERS = 2          # 内容编码器层数（双向自注意力，�
 CONTENT_TF_EXPERTS = 4         # 每层 FFN 专家数
 CONTENT_TF_TOP_K = 2           # 每 token 激活专家数
 CONTENT_TF_FF_DIM = 1536       # 单专家 FFN 宽度（与 TF-1 检索同级，手机端标准算子）
-CONTENT_PACK_MAX_SEGS = 4      # 一次前向最多打包的文本段数
+CONTENT_PACK_MAX_SEGS = 6      # 一次前向最多打包的文本段数（256 上下文可多塞两段）
 CONTENT_PACK_PROB = 0.4        # LM/SFT 把多段文本打进同一 src 的概率
 LSTM_A_EXPERTS = 4             # LSTM 回退：专家个数
 LSTM_A_TOP_K = 1               # LSTM 回退：每条序列只激活 1 个专家
@@ -265,10 +265,13 @@ ANWAN_EMO_DIR_NORM = os.environ.get("ANWAN_EMO_DIR_NORM", "std")
 # 记忆检索：同语种相似度加成（方案A软标记的检索侧落地）
 SEARCH_LANG_BONUS = 0.15
 
-# ==================== router 自动分区 ====================
+# ==================== router 自动分区（前置通用路由）====================
 NUM_MODULES = 4            # 内容 Transformer / LSTM-B 情感 / TF-1 检索 / TF-2 生成
 ROUTER_ENTROPY_WEIGHT = 0.1  # 熵正则系数（防路由坍缩；>0 鼓励 soft 组合不垄断）
 ROUTER_ENTROPY_FLOOR = 0.8   # 熵下限：batch 边际路由熵低于此值才开始惩罚
+ROUTER_HIDDEN = 256          # 前置路由 MLP 隐层
+ROUTER_SKIP_THRESHOLD = 0.12 # 推理时内容/检索权重低于此值则跳过该通道
+ROUTER_ALWAYS_ON = (1, 3)    # 情感(1)、生成(3)永不跳过
 STAGE = "main"             # "main": 仅对角主通路（内容↔检索、情感↔生成）
                            # "cross": 开放交叉辅通路（内容→生成、情感→检索），弱门控起步
 CROSS_GATE_INIT = 0.1      # 交叉辅通路门控初始值（弱门控）
@@ -303,13 +306,13 @@ RETRIEVAL_PROFILES = {
         "top_k": 1,            # 只注入 1 条，避免回复被无关记忆稀释
         "min_score": 0.32,     # 阈值拉高：宁可不用记忆，也不要用错的
         "spread": False,       # 扩散的价值在"关联深挖"，弹幕没有深挖的时间预算
-        "max_tokens": 8,       # 单条注入上限压到 8，腾出上下文给当前弹幕
+        "max_tokens": 16,      # 弹幕仍短，但 256 上下文下单条可到一句完整话
     },
     "dm": {
         "top_k": 3,
         "min_score": 0.12,
         "spread": True,        # 私聊允许一跳扩散，换取跨记忆关联
-        "max_tokens": 15,
+        "max_tokens": 48,
     },
 }
 DEFAULT_PROFILE = "dm"        # 未知场景时的保守档位
@@ -321,12 +324,13 @@ AWIL_ENABLED_IN_TRAIN = False
 # ==================== 推理 ====================
 TEMPERATURE = 0.8
 TOP_P = 0.9
-GEN_MAX_LEN = 1024         # 生成最长 token 数（动态长度，支持长序列推理）
+TGT_MAX_LEN = 256          # 训练目标最长 token 数（与生成对齐；4 层 MoE decoder 写圆的上限）
+GEN_MAX_LEN = 256          # 生成最长 token 数（与 TGT_MAX_LEN 对齐；无 KV cache 时再长会空转）
 REPLY_MIN_LEN = 2          # 生成结果低于此长度视为无效，走兜底
 
 # ==================== 多轮历史（P1-1） ====================
-HISTORY_TURNS = 4          # respond 保留最近 N 轮显式历史
-HISTORY_MAX_TOKENS = 36    # 历史段注入 src 的最大 token 预算（多段打包后给上下文更多位子）
+HISTORY_TURNS = 6          # respond 保留最近 N 轮显式历史（256 上下文可多留两轮）
+HISTORY_MAX_TOKENS = 120   # 历史段注入 src 的最大 token 预算
 MULTI_TURN_PROB = 0.3      # SFT 样本掺入多轮历史的概率
 
 # ---- P1-2 外部长期记忆（事实/日记类） ----
@@ -334,7 +338,7 @@ MEMORY_FILE = os.path.join(MODEL_DIR, "external_memory.json")   # 外部记忆�
 WORDBOOK_FILE = os.path.join(MODEL_DIR, "wordbook.json")         # 生词本（生僻词/外语查询）
 MEMORY_TOP_K = 3          # 检索注入条数
 MEMORY_MIN_SCORE = 0.10   # 注入的相似度下限（过低不注入，避免噪声）
-MEMORY_MAX_TOKENS = 20    # 单条记忆注入 src 的最长 token 数
+MEMORY_MAX_TOKENS = 48    # 单条记忆注入 src 的最长 token 数
 MEMORY_DECAY = 0.995      # 平滑遗忘：每次触发遗忘时全体活跃记忆权重衰减系数
 MEMORY_EXPIRE_WEIGHT = 0.45  # 权重低于此值的低活跃记忆转为"归档"（检索不再返回，可手动恢复）
 MEMORY_MAX_ARCHIVE = 200  # 归档上限（超过则真正物理清理最旧归档，防止 json 无限膨胀）
@@ -2356,7 +2360,7 @@ class PositionalEncoding(nn.Module):
 class UnifiedAnwanModel(nn.Module):
     """
     一体化统一模型：内容通道(双向专家 Transformer) / LSTM-B(情感·跨轮) / TF-1(检索) / TF-2(生成)
-    同一实例四组参数块，共享 embedding + 输出投影；中央 soft router 自动分区。
+    同一实例四组参数块，共享 embedding + 输出投影；前置通用路由先拍板再计算。
     """
 
     def __init__(
@@ -2382,7 +2386,8 @@ class UnifiedAnwanModel(nn.Module):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.emotion_dim = emotion_dim
-        self.max_len = getattr(config, "MAX_LEN", 80)
+        self.max_len = getattr(config, "MAX_LEN", 256)
+        self.tgt_max_len = getattr(config, "TGT_MAX_LEN", getattr(config, "GEN_MAX_LEN", 256))
         self.num_intents = num_intents
         self.entropy_floor = entropy_floor
         self.router_entropy_weight = router_entropy_weight
@@ -2394,6 +2399,7 @@ class UnifiedAnwanModel(nn.Module):
         # 默认 tf：双向专家 Transformer（标准注意力，手机端可用）。
         # ssm / lstm 仍作回退；MOE_SCOPE="decoder" 时走稠密 LSTM。
         self.lstm_a_hidden = lstm_hidden
+        self.content_dim = embed_dim
         self.moe_scope = getattr(config, "MOE_SCOPE", "decoder")
         self.lstm_a_pool = None
         self.lstm_a = None
@@ -2411,6 +2417,7 @@ class UnifiedAnwanModel(nn.Module):
                 max_segs=getattr(config, "CONTENT_PACK_MAX_SEGS", 4),
             )
             content_dim = embed_dim
+            self.content_dim = content_dim
         elif backbone_type == "ssm" and self.moe_scope == "all":
             ssm_d_model = getattr(config, "EMBED_DIM", 1536)
             self.ssm_backbone = Mamba2Backbone(
@@ -2418,6 +2425,7 @@ class UnifiedAnwanModel(nn.Module):
                 num_layers=1, dropout=config.DROPOUT, layer_idx=0,
             )
             content_dim = ssm_d_model
+            self.content_dim = content_dim
         elif self.moe_scope == "all":
             self.lstm_a_pool = _ExpertLSTMPool(
                 embed_dim, getattr(config, "LSTM_A_EXPERT_HIDDEN", lstm_hidden),
@@ -2426,11 +2434,13 @@ class UnifiedAnwanModel(nn.Module):
                 min_load=getattr(config, "LSTM_A_MIN_LOAD", 0.0),
             )
             content_dim = self.lstm_a_pool.hidden
+            self.content_dim = content_dim
         else:
             self.lstm_a = nn.LSTM(
                 embed_dim, lstm_hidden, num_layers=1, batch_first=True, bidirectional=False
             )
             content_dim = lstm_hidden
+            self.content_dim = content_dim
 
         # ---- LSTM-B：情感通道（有状态 / 跨轮 / emotion_dim）----
         # 800M 规格：emb_proj(1536→512) + LSTM(512→3600) + out_proj(3600→512)
@@ -2519,22 +2529,32 @@ class UnifiedAnwanModel(nn.Module):
         # 情感→生成 主通路强度（1.0 起步，可学习）
         self.emotion_gate = nn.Parameter(torch.tensor(1.0))
 
-        # ---- 中央自动分区 router（soft 门控，非 top-k）----
-        # 四个模块各出一个分量表示，router 决定 softmax 组合权重（分区由训练自动学出）
+        # ---- 前置通用路由：看输入 + 意图 + PAD，先拍板再跑通道 ----
+        # 内容/检索可跳过；情感(1)、生成(3)始终在线。旧 checkpoint 的
+        # module_projs / router_net 形状对不上，load 时走形状适配丢弃。
+        router_hidden = int(getattr(config, "ROUTER_HIDDEN", 256))
+        self.router_token_pool = nn.Linear(embed_dim, router_hidden)
+        self.router_intent_emb = nn.Embedding(num_intents, router_hidden)
+        self.router_pad_proj = nn.Linear(emotion_vec_dim, router_hidden)
+        self.router_net = nn.Sequential(
+            nn.Linear(router_hidden * 3, router_hidden),
+            nn.SiLU(),
+            nn.Linear(router_hidden, 4),
+        )
         self.module_projs = nn.ModuleList([
-            nn.Linear(content_dim, embed_dim),   # 内容通道（tf 时即 embed_dim）
-            nn.Linear(emotion_dim, embed_dim),   # LSTM-B 情感
-            nn.Linear(embed_dim, embed_dim),     # TF-1 检索
-            nn.Linear(embed_dim, embed_dim),     # TF-2 生成
+            nn.Linear(content_dim, embed_dim),
+            nn.Linear(emotion_dim, embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, embed_dim),
         ])
-        self.router_net = nn.Linear(embed_dim * 4, 4)  # softmax 组合权重
 
         # ---- 一体化意图头（14 意图多任务监督，train 可选）----
         self.intent_head = nn.Linear(embed_dim, num_intents)
 
         self.dropout = nn.Dropout(dropout)
         # ---- 分化锁定（功能区固化）----
-        self._locked_mask = None  # 训练后固化的硬门控掩码 [4]；None=未锁定
+        self._locked_mask = None          # 全局硬门控掩码 [4]；None=未锁定
+        self._intent_lock_table = None    # [num_intents, 4] 按意图掩码；优先于全局 mask
         # ---- AWIL 内部通信总线（零新依赖，旁路日志/调试）----
         self.awil_bus = AWILBus(capacity=2048)
         self._init_weights()
@@ -2548,74 +2568,143 @@ class UnifiedAnwanModel(nn.Module):
             if p.dim() >= 2 and "output_proj" not in name and not any(s in name for s in skip):
                 nn.init.xavier_uniform_(p)
 
-    # ------------------------------------------------ 推理辅助 ----------
+    # ------------------------------------------------ 前置通用路由 ----------
     def _module_vectors(self, content_out, emotion_out, mem, dec_out):
-        """router 输入：四模块序列表示的时序均值 + 各自投影到 embed_dim"""
+        """四通道序列均值投影到 embed_dim，供融合残差使用。"""
         feats = []
         for proj, feat in zip(
             self.module_projs,
             [content_out.mean(dim=1), emotion_out.mean(dim=1), mem.mean(dim=1), dec_out.mean(dim=1)],
         ):
             feats.append(proj(feat))
-        return feats  # list of [B, embed_dim]
+        return feats
 
-    def route(self, feats):
-        """竞争门控（自组织分化版）：
-        - 训练：soft 加权 + 正则约束（竞争 + 均值 + 正交）
-        - 推理且已锁定：argmax 硬门控，只激活主导模块
-        - 返回 weights + entropy + mean_reg + ortho_reg
+    def _always_on_mask(self, device, dtype):
+        mask = torch.zeros(4, device=device, dtype=dtype)
+        for idx in getattr(config, "ROUTER_ALWAYS_ON", (1, 3)):
+            mask[int(idx)] = 1.0
+        return mask
+
+    def _apply_lock(self, weights, intent_idx=None):
+        """推理期按意图掩码（优先）或全局掩码限制通道；情感/生成永不关掉。"""
+        if self.training:
+            return weights
+        B = weights.size(0)
+        always = self._always_on_mask(weights.device, weights.dtype).unsqueeze(0)
+        mask = None
+        table = getattr(self, "_intent_lock_table", None)
+        if table is not None and intent_idx is not None:
+            idx = intent_idx.to(device=table.device)
+            if idx.dim() == 0:
+                idx = idx.unsqueeze(0)
+            if idx.size(0) != B:
+                idx = idx[:B] if idx.size(0) > B else idx[0:1].expand(B)
+            mask = table.to(device=weights.device, dtype=weights.dtype)[idx.clamp(0, table.size(0) - 1)]
+        elif self._locked_mask is not None:
+            mask = self._locked_mask.to(device=weights.device, dtype=weights.dtype).unsqueeze(0).expand(B, -1)
+        if mask is None:
+            return weights
+        mask = torch.maximum(mask, always.expand_as(mask))
+        masked = weights * mask
+        s = masked.sum(dim=-1, keepdim=True)
+        return torch.where(s > 1e-9, masked / s.clamp_min(1e-9), weights)
+
+    def route_from_src(self, src_emb, intent_idx=None, prev_emotion_vec=None, src_mask=None):
+        """前置路由：只看输入摘要 + 意图 + 上一轮 PAD，在通道计算之前出 4 维权重。
+        返回 weights [B,4], entropy, mean_reg, intent_logits [B, num_intents], intent_idx [B]
         """
-        router_in = torch.cat(feats, dim=-1)  # [B, 4*E]
-        logits = self.router_net(self.dropout(router_in))
-        # 竞争强度随 epoch 自适应（外部通过 _competition_temp 注入）
-        temp = getattr(self, "_competition_temp", 1.0)
-        weights = F.softmax(logits / temp, dim=-1)  # [B, 4]
-        avg_w = weights.mean(dim=0)          # [4]
-        entropy = -(avg_w * torch.log(avg_w.clamp_min(1e-9))).sum()
-        # 自组织均值约束：模块0/1一组，模块2/3一组，组内互斥
-        group0 = avg_w[0:2].sum()  # 内容+情感
-        group1 = avg_w[2:4].sum()  # 检索+生成
-        mean_reg = ((group0 - group1).abs() - 0.2).clamp_min(0.0)
-        # 模块正交约束：各模块输出表示的余弦相似度惩罚
-        if len(feats) >= 2:
-            stacked = torch.stack(feats, dim=0)  # [4, B, E]
-            normed = F.normalize(stacked, dim=-1)
-            sim_mat = torch.mm(normed.mean(dim=1), normed.mean(dim=1).t())  # [4,4]
-            ortho_reg = (sim_mat ** 2).sum() - 4.0  # 对角线=1，非对角线趋近0
-            ortho_reg = ortho_reg.clamp_min(0.0)
+        if src_mask is not None:
+            keep = (~src_mask).unsqueeze(-1).to(dtype=src_emb.dtype)
+            denom = keep.sum(dim=1).clamp_min(1.0)
+            pooled = (src_emb * keep).sum(dim=1) / denom
         else:
-            ortho_reg = torch.tensor(0.0, device=logits.device)
-        # 硬门控：推理模式且已锁定时，按固化掩码限制主导模块
-        if not self.training and self._locked_mask is not None:
-            mask = self._locked_mask.to(device=weights.device, dtype=weights.dtype).unsqueeze(0)  # [1,4]
-            masked = weights * mask
-            s = masked.sum(dim=-1, keepdim=True)
-            # 掩码全零时退回原权重，避免除零
-            weights = torch.where(s > 1e-9, masked / s.clamp_min(1e-9), weights)
-            hard = torch.zeros_like(weights)
-            hard.scatter_(1, weights.argmax(dim=1, keepdim=True), 1.0)
-            weights = hard
-        return weights, entropy, mean_reg, ortho_reg
+            pooled = src_emb.mean(dim=1)
+        tok_h = self.router_token_pool(pooled)
+        if intent_idx is None:
+            intent_h = self.router_intent_emb.weight.mean(dim=0, keepdim=True).expand(src_emb.size(0), -1)
+        else:
+            if not isinstance(intent_idx, torch.Tensor):
+                intent_idx = torch.tensor([int(intent_idx)], device=src_emb.device, dtype=torch.long)
+            else:
+                intent_idx = intent_idx.to(device=src_emb.device, dtype=torch.long)
+            if intent_idx.dim() == 0:
+                intent_idx = intent_idx.unsqueeze(0)
+            if intent_idx.size(0) != src_emb.size(0):
+                intent_idx = (intent_idx[:src_emb.size(0)]
+                              if intent_idx.size(0) > src_emb.size(0)
+                              else intent_idx[0:1].expand(src_emb.size(0)))
+            intent_h = self.router_intent_emb(intent_idx.clamp(0, self.num_intents - 1))
+        if prev_emotion_vec is None:
+            pad_h = tok_h.new_zeros(src_emb.size(0), tok_h.size(-1))
+        else:
+            pv = prev_emotion_vec
+            if pv.dim() == 1:
+                pv = pv.unsqueeze(0)
+            if pv.size(0) != src_emb.size(0):
+                pv = pv[:src_emb.size(0)] if pv.size(0) > src_emb.size(0) else pv[0:1].expand(src_emb.size(0), -1)
+            pad_h = self.router_pad_proj(pv)
+        hidden = torch.cat([tok_h, intent_h, pad_h], dim=-1)
+        logits = self.router_net(self.dropout(hidden))
+        temp = getattr(self, "_competition_temp", 1.0)
+        weights = F.softmax(logits / max(float(temp), 1e-4), dim=-1)
+        intent_logits = self.intent_head(pooled)
+        if intent_idx is None:
+            intent_idx = intent_logits.argmax(dim=-1)
+        weights = self._apply_lock(weights, intent_idx)
+        avg_w = weights.mean(dim=0)
+        entropy = -(avg_w * torch.log(avg_w.clamp_min(1e-9))).sum()
+        group0 = avg_w[0:2].sum()
+        group1 = avg_w[2:4].sum()
+        mean_reg = ((group0 - group1).abs() - 0.2).clamp_min(0.0)
+        return weights, entropy, mean_reg, intent_logits, intent_idx
+
+    def route(self, feats, intent_idx=None):
+        """兼容旧调用：有四路特征时只做融合侧正交正则，权重仍应由 route_from_src 给出。"""
+        if len(feats) >= 2:
+            stacked = torch.stack(feats, dim=0)
+            normed = F.normalize(stacked, dim=-1)
+            sim_mat = torch.mm(normed.mean(dim=1), normed.mean(dim=1).t())
+            ortho_reg = ((sim_mat ** 2).sum() - 4.0).clamp_min(0.0)
+        else:
+            ortho_reg = torch.zeros((), device=feats[0].device)
+        return ortho_reg
+
+    def channel_active(self, weights, idx):
+        """该通道本步是否要算。情感/生成永远 True；训练期全开以便梯度到达 router。"""
+        if int(idx) in getattr(config, "ROUTER_ALWAYS_ON", (1, 3)):
+            return True
+        if self.training:
+            return True
+        thr = float(getattr(config, "ROUTER_SKIP_THRESHOLD", 0.12))
+        return bool((weights[:, int(idx)] >= thr).any().item())
 
     @torch.no_grad()
     def lock_specialization(self, tokenizer, texts_by_intent, device="cpu"):
-        """分化锁定：根据语料评估各意图类型的主导模块，固化硬门控掩码。
-        texts_by_intent: dict[str, list[str]]，如 {"greeting": ["你好", "嗨"], ...}
-        返回特化报告 dict{"intents": {"greeting": {"top_module": 2, "top_weight": 0.65, ...}},
-                           "global": {"entropy": 0.8, "locked": True}}
-        """
+        """按意图固化通道掩码：每类意图取平均路由的 top-2，情感+生成强制常驻。"""
         self.eval()
         report = {"intents": {}, "global": {"entropy": None, "locked": False}}
         if not texts_by_intent:
             return report
+        prev_mask = self._locked_mask
+        prev_table = self._intent_lock_table
+        self._locked_mask = None
+        self._intent_lock_table = None
+        table = torch.zeros(self.num_intents, 4, device=device)
+        always = self._always_on_mask(device, torch.float32)
         all_ws = []
+        name_to_idx = {n: i for i, n in enumerate(getattr(config, "INTENTS", []))}
         for intent, texts in texts_by_intent.items():
             ws = []
+            intent_i = name_to_idx.get(intent, 0)
             for t in texts:
                 ids = tokenizer.encode(t)
                 src = torch.tensor([ids], device=device)
                 tgt = torch.tensor([[BOS_IDX]], device=device)
-                out = self(src, tgt, emotion_state=None, stage="main", return_intent=False)
+                out = self(
+                    src, tgt, emotion_state=None, stage="main",
+                    return_intent=False,
+                    intent_labels=torch.tensor([intent_i], device=device),
+                )
                 ws.append(out["router_weights"][0].cpu())
             avg = torch.stack(ws).mean(dim=0)
             top = int(avg.argmax())
@@ -2624,21 +2713,33 @@ class UnifiedAnwanModel(nn.Module):
                 "top_weight": float(avg[top]),
                 "weights": [float(v) for v in avg],
             }
+            row = torch.zeros(4)
+            row[avg.topk(2).indices] = 1.0
+            row = torch.maximum(row, always.cpu())
+            if intent in name_to_idx:
+                table[name_to_idx[intent]] = row.to(device)
             all_ws.extend(ws)
         if all_ws:
             global_avg = torch.stack(all_ws).mean(dim=0)
             report["global"]["entropy"] = float(-(global_avg * torch.log(global_avg.clamp_min(1e-9))).sum())
             report["global"]["avg_load"] = [float(v) for v in global_avg]
-            # 锁定：计算全局主导模块掩码（取全局平均 top-2 置 1）
             mask = torch.zeros(4, device=device)
-            top2 = global_avg.topk(2).indices
-            mask[top2] = 1.0
-            # v3：情感模块（下标 1）强制常驻 —— 它是唯一持有跨轮 (h,c) 与 PAD 向量
-            # 的完整模型，被中央 router 抑制等于跨轮人设直接断电，比路由坍缩更致命。
-            mask[1] = 1.0
+            mask[global_avg.topk(2).indices] = 1.0
+            mask = torch.maximum(mask, always)
             self._locked_mask = mask
+            for i in range(self.num_intents):
+                if table[i].sum() < 1e-6:
+                    table[i] = mask
+            self._intent_lock_table = table
             report["global"]["locked"] = True
             report["global"]["mask"] = [int(v) for v in mask.cpu()]
+            report["global"]["intent_masks"] = {
+                name: [int(v) for v in table[i].cpu()]
+                for name, i in name_to_idx.items()
+            }
+        else:
+            self._locked_mask = prev_mask
+            self._intent_lock_table = prev_table
         return report
 
     # ------------------------------------------------ 主干 --------------
@@ -2665,58 +2766,65 @@ class UnifiedAnwanModel(nn.Module):
         device = src.device
         B, T = src.size()
         T2 = tgt_in.size(1)
-        lengths = _effective_lengths(src)             # [B] 有效 token 数
+        lengths = _effective_lengths(src)
+        src_mask = _pad_mask(src, device)
+        src_emb = self.shared_embedding(src)
 
-        src_emb = self.shared_embedding(src)          # [B, T, E]
+        # ---- 前置路由：先拍板，再决定跑哪些通道 ----
+        weights, entropy, mean_reg, intent_logits, intent_idx = self.route_from_src(
+            src_emb, intent_idx=intent_labels, prev_emotion_vec=prev_emotion_vec, src_mask=src_mask,
+        )
+        run_content = self.channel_active(weights, 0)
+        run_retr = self.channel_active(weights, 2)
+        if run_retr:
+            run_content = True
 
-        # ---- 内容通道（双向专家 Transformer / SSM / LSTM；可一次吃多段）----
-        content_out, aux_content, usage_content = self._encode_content(
-            src_emb, lengths, T, src=src
-        )                                             # [B, T, content_dim]
+        # ---- 内容通道（可跳过）----
+        aux_content = None
+        if run_content:
+            content_out, aux_content, _ = self._encode_content(src_emb, lengths, T, src=src)
+        else:
+            content_out = src_emb.new_zeros(B, T, self.content_dim)
 
-        # ---- LSTM-B：情感通道（有状态，跨轮；仅有效 token 演化）----
+        # ---- LSTM-B：情感通道始终在线 ----
         if emotion_state is not None:
             h0, c0 = emotion_state
         else:
             h0 = torch.zeros(1, B, self.lstm_b_hidden, device=device)
             c0 = torch.zeros(1, B, self.lstm_b_hidden, device=device)
-        emotion_out, (hB, cB), aux_emo, usage_emo = self._encode_emotion(
+        emotion_out, (hB, cB), aux_emo, _ = self._encode_emotion(
             self.emb_proj(src_emb), lengths, T, h0, c0
-        )                                             # [B, T, emotion_dim]
+        )
         new_state = (hB.detach().clone(), cB.detach().clone())
 
-        # ---- 对角主通路：内容 → 检索（TF-1）----
-        mem_in = self.content_proj(content_out)       # [B, T, E]
+        # ---- 检索 TF-1（可跳过；跳过时用内容投影或情感摘要占位）----
+        aux_enc = None
+        if run_retr:
+            mem_in = self.content_proj(content_out)
+            if stage == "cross":
+                emo_pool = emotion_out.mean(dim=1)
+                gate = self.cross_gate.clamp(max=0.5)
+                mem_in = mem_in + gate * self.emotion_proj(emo_pool).unsqueeze(1)
+            mem, aux_enc = self._encode_mem(mem_in, src_mask)
+        else:
+            mem = self.content_proj(content_out)
 
-        # ---- 交叉辅通路：情感 → 检索（stage=cross 且弱门控起步）----
-        if stage == "cross":
-            emo_pool = emotion_out.mean(dim=1)        # [B, emotion_dim]
-            gate = self.cross_gate.clamp(max=0.5)
-            mem_in = mem_in + gate * self.emotion_proj(emo_pool).unsqueeze(1)
-
-        src_mask = _pad_mask(src, device)
-        mem, aux_enc = self._encode_mem(mem_in, src_mask)       # [B, T, E]
-
-        # ---- 显式情感向量（P4）：PAD 语义头 + 跨轮注入 ----
-        emo_pool = emotion_out.mean(dim=1)                     # [B, emotion_dim]
-        emotion_vec = torch.tanh(self.emotion_vec_head(emo_pool))  # [B, 3] ∈ [-1,1]
-        # ---- 对角主通路：情感 → 生成（把情感摘要注入检索 memory）----
-        emo_cond = self.emotion_proj(emo_pool)                 # [B, E]
+        emo_pool = emotion_out.mean(dim=1)
+        emotion_vec = torch.tanh(self.emotion_vec_head(emo_pool))
+        emo_cond = self.emotion_proj(emo_pool)
         if prev_emotion_vec is not None:
             pv = prev_emotion_vec
             if pv.dim() == 1:
                 pv = pv.unsqueeze(0).expand(B, -1)
             if pv.size(0) != B:
                 pv = pv[:B] if pv.size(0) > B else pv[0:1].expand(B, -1)
-            # 上一轮 PAD 向量作为跨轮情感语境注入（训练时随 batch 回喂）
-            vec_cond = self.vec_proj(pv)
-            emo_cond = emo_cond + config.EMOTION_VEC_INJECT * vec_cond
+            emo_cond = emo_cond + config.EMOTION_VEC_INJECT * self.vec_proj(pv)
         mem = mem + self.emotion_gate * emo_cond.unsqueeze(1) * 0.4
 
-        # ---- TF-2：生成（MoE 解码器层，逐层传递并收集 aux_loss）----
-        tgt_emb = self.pos_encoding(self.shared_embedding(tgt_in))  # [B, T2, E]
-        if stage == "cross":
-            content_pool = content_out.mean(dim=1)    # [B, lstm_hidden]
+        # ---- TF-2：生成始终在线 ----
+        tgt_emb = self.pos_encoding(self.shared_embedding(tgt_in))
+        if stage == "cross" and run_content:
+            content_pool = content_out.mean(dim=1)
             gate = self.cross_gate.clamp(max=0.5)
             tgt_emb = tgt_emb + gate * self.content_proj(content_pool).unsqueeze(1) * 0.4
 
@@ -2732,27 +2840,20 @@ class UnifiedAnwanModel(nn.Module):
                 memory_key_padding_mask=src_mask,
             )
             moe_aux_losses.append(aux)
-        # MoE 负载均衡辅助 loss 总和
         for _aux in (aux_content, aux_emo, aux_enc):
             if _aux is not None:
                 moe_aux_losses.append(_aux)
         moe_aux_total = sum(moe_aux_losses) if moe_aux_losses else torch.tensor(0.0, device=device)
 
-        # ---- 中央 router：竞争门控（自组织分化）----
         feats = self._module_vectors(content_out, emotion_out, mem, dec_out)
-        weights, entropy, mean_reg, ortho_reg = self.route(feats)  # [B,4] / scalar / reg / reg
-
-        fused = torch.stack(feats, dim=1)            # [B, 4, E]
-        fused = (fused * weights.unsqueeze(-1)).sum(dim=1)  # [B, E] soft 加权融合
-
-        # ---- 共享输出投影 ----
-        logits = self.output_proj(dec_out + fused.unsqueeze(1))  # [B, T2, vocab]
+        ortho_reg = self.route(feats)
+        fused = (torch.stack(feats, dim=1) * weights.unsqueeze(-1)).sum(dim=1)
+        logits = self.output_proj(dec_out + fused.unsqueeze(1))
+        self._last_router_weights = weights.detach().mean(dim=0).cpu().tolist()
 
         result = {
             "logits": logits,
             "new_state": new_state,
-            # 情绪方向 loss 需要**带梯度**的进出状态；new_state 已 detach，
-            # 梯度到不了 LSTM-B，这里单独暴露（只给损失用，不外传）
             "emo_h_in": h0 if emotion_state is not None else torch.zeros_like(h0),
             "emo_h_out": hB,
             "emotion_vec": emotion_vec,
@@ -2763,28 +2864,18 @@ class UnifiedAnwanModel(nn.Module):
             "router_entropy": entropy,
             "router_mean_reg": mean_reg,
             "router_ortho_reg": ortho_reg,
+            "intent_logits": intent_logits,
         }
 
-        # ---- 意图头（可选监督）----
-        if return_intent or intent_labels is not None:
-            intent_logits = self.intent_head(fused)   # [B, num_intents]
-            result["intent_logits"] = intent_logits
-
-        # ---- AWIL：发射路由 + 意图消息（旁路日志）----
-        # 训练期默认关闭：weights[0].cpu() 在 GPU 上是强制同步，每步一次会拖慢训练，
-        # 与"零性能影响"的说法不符。推理期（eval 模式）保留完整流水账。
         if (getattr(self, "awil_bus", None) is not None and self.awil_bus.enabled
                 and not (self.training and not config.AWIL_ENABLED_IN_TRAIN)):
             self.awil_bus.emit_route(
                 AWIL.MOD_ROUTER, AWIL.MOD_BUS,
                 weights[0].cpu().tolist(), float(entropy.cpu().item())
             )
-            if "intent_logits" in result:
-                intent_id = int(result["intent_logits"][0].argmax().cpu().item())
-                intent_conf = float(F.softmax(result["intent_logits"][0], dim=0)[intent_id].cpu().item())
-                self.awil_bus.emit_intent(
-                    AWIL.MOD_INTENT, AWIL.MOD_BUS, intent_id, intent_conf
-                )
+            intent_id = int(intent_logits[0].argmax().cpu().item())
+            intent_conf = float(F.softmax(intent_logits[0], dim=0)[intent_id].cpu().item())
+            self.awil_bus.emit_intent(AWIL.MOD_INTENT, AWIL.MOD_BUS, intent_id, intent_conf)
 
         return result
 
@@ -2962,7 +3053,7 @@ class UnifiedAnwanModel(nn.Module):
         self,
         src,
         emotion_state=None,
-        max_len=25,
+        max_len=None,
         temperature=0.8,
         top_p=0.9,
         strategy="nucleus",
@@ -2970,22 +3061,42 @@ class UnifiedAnwanModel(nn.Module):
         eos_id=EOS_IDX,
         bos_id=BOS_IDX,
         prev_emotion_vec=None,
+        intent_idx=None,
     ):
         """
         自回归生成：
-        - 编码一次（内容通道 + LSTM-B + TF-1），得到 mem 与跨轮情感 state（返回给推理引擎）
+        - 前置路由一次，按权重决定是否跑内容/检索；情感与生成始终编码
         - 解码循环：每个时间步对已生成前缀做一次 TF-2，取末位 logits 采样
         - strategy: "greedy" | "top_k" | "nucleus"
         返回 (token_ids, new_state, router_weights, router_entropy, emotion_vec)
-        - router_weights/router_entropy 取解码第 1 步（tgt=[BOS] 等效原 _router_probe，
-          受训时一步即得，免除额外二次前向）
         """
+        if max_len is None:
+            max_len = int(getattr(config, "GEN_MAX_LEN", 256))
         device = src.device
         B, T = src.size()
         lengths = _effective_lengths(src)
-
+        src_mask = _pad_mask(src, device)
         src_emb = self.shared_embedding(src)
-        content_out, _, _ = self._encode_content(src_emb, lengths, T, src=src)
+
+        if intent_idx is not None and not isinstance(intent_idx, torch.Tensor):
+            intent_idx = torch.tensor([int(intent_idx)], device=device, dtype=torch.long)
+
+        weights, entropy, _, _, _ = self.route_from_src(
+            src_emb, intent_idx=intent_idx, prev_emotion_vec=prev_emotion_vec, src_mask=src_mask,
+        )
+        router_weights = weights[0].detach().cpu().tolist()
+        router_entropy = float(entropy.detach().cpu().item())
+        self._last_router_weights = router_weights
+        run_content = self.channel_active(weights, 0)
+        run_retr = self.channel_active(weights, 2)
+        if run_retr:
+            run_content = True
+
+        if run_content:
+            content_out, _, _ = self._encode_content(src_emb, lengths, T, src=src)
+        else:
+            content_out = src_emb.new_zeros(B, T, self.content_dim)
+
         if emotion_state is not None:
             h0, c0 = emotion_state
         else:
@@ -2994,14 +3105,17 @@ class UnifiedAnwanModel(nn.Module):
         emotion_out, (hB, cB), _, _ = self._encode_emotion(self.emb_proj(src_emb), lengths, T, h0, c0)
         new_state = (hB.clone(), cB.clone())
 
-        mem_in = self.content_proj(content_out)
-        if stage == "cross":
-            emo_pool = emotion_out.mean(dim=1)
-            gate = self.cross_gate.clamp(max=0.5)
-            mem_in = mem_in + gate * self.emotion_proj(emo_pool).unsqueeze(1)
-        src_mask = _pad_mask(src, device)
-        mem, _ = self._encode_mem(mem_in, src_mask)
-        emotion_vec = torch.tanh(self.emotion_vec_head(emotion_out.mean(dim=1)))  # [B,3] ∈ [-1,1]
+        if run_retr:
+            mem_in = self.content_proj(content_out)
+            if stage == "cross":
+                emo_pool = emotion_out.mean(dim=1)
+                gate = self.cross_gate.clamp(max=0.5)
+                mem_in = mem_in + gate * self.emotion_proj(emo_pool).unsqueeze(1)
+            mem, _ = self._encode_mem(mem_in, src_mask)
+        else:
+            mem = self.content_proj(content_out)
+
+        emotion_vec = torch.tanh(self.emotion_vec_head(emotion_out.mean(dim=1)))
         emo_cond = self.emotion_proj(emotion_out.mean(dim=1))
         if prev_emotion_vec is not None:
             pv = prev_emotion_vec
@@ -3011,24 +3125,18 @@ class UnifiedAnwanModel(nn.Module):
                 pv = pv[:B] if pv.size(0) > B else pv[0:1].expand(B, -1)
             emo_cond = emo_cond + config.EMOTION_VEC_INJECT * self.vec_proj(pv)
         mem = mem + self.emotion_gate * emo_cond.unsqueeze(1) * 0.4
-
-        # router 需要 content/emotion 表示（SEQ 维平均）
         content_pool = content_out.mean(dim=1)
-        emotion_pool = emotion_out.mean(dim=1)
 
         generated = torch.full((B, 1), bos_id, device=device, dtype=torch.long)
-        router_weights = None
-        router_entropy = None
 
         for _ in range(max_len):
             T2 = generated.size(1)
             tgt_emb = self.pos_encoding(self.shared_embedding(generated))
-            if stage == "cross":
+            if stage == "cross" and run_content:
                 gate = self.cross_gate.clamp(max=0.5)
                 tgt_emb = tgt_emb + gate * self.content_proj(content_pool).unsqueeze(1) * 0.4
             tgt_mask = _build_causal_mask(T2, device)
             tgt_pad_mask = _pad_mask(generated, device)
-            # MoE decoder 层逐层前向（推理时 aux_loss 不返回）
             dec_out = tgt_emb
             for dec_layer in self.tf2:
                 dec_out, _ = dec_layer(
@@ -3038,12 +3146,7 @@ class UnifiedAnwanModel(nn.Module):
                     memory_key_padding_mask=src_mask,
                 )
             feats = self._module_vectors(content_out, emotion_out, mem, dec_out)
-            weights, entropy, _, _ = self.route(feats)
-            if router_weights is None:      # 第 1 步即等效原 _router_probe
-                router_weights = weights[0].cpu().tolist()
-                router_entropy = float(entropy.cpu().item())
-            fused = torch.stack(feats, dim=1)         # [B, 4, E]
-            fused = (fused * weights.unsqueeze(-1)).sum(dim=1)  # [B, E]
+            fused = (torch.stack(feats, dim=1) * weights.unsqueeze(-1)).sum(dim=1)
             logits = self.output_proj(dec_out[:, -1:, :] + fused.unsqueeze(1))[:, -1, :]
             logits = logits / max(temperature, 1e-6)
 
@@ -3154,6 +3257,9 @@ class UnifiedAnwanModel(nn.Module):
             else [round(v, 4) for v in l.moe_ffn.last_usage.detach().cpu().tolist()]
             for l in self.tf2
         ]
+        last_w = getattr(self, "_last_router_weights", None)
+        if last_w is not None:
+            info["router"] = [round(v, 4) for v in last_w]
         return info
 
     def count_active_parameters(self):
@@ -3693,6 +3799,7 @@ class DataPipeline:
     def __init__(self, tokenizer, max_len=None, folder_path=None, verbose=True):
         self.tokenizer = tokenizer
         self.max_len = max_len or config.MAX_LEN
+        self.tgt_max_len = getattr(config, "TGT_MAX_LEN", getattr(config, "GEN_MAX_LEN", self.max_len))
         self.qa_pairs = load_builtin_corpus()
         folder = folder_path or config.TRAIN_FOLDER
         # 通用扫描：支持 JSONL/Alpaca/ShareGPT/OpenAI/CSV/TSV/对话文本/散文，
@@ -3765,23 +3872,27 @@ class DataPipeline:
                     src_idx = pack_content_segments(
                         self.tokenizer, list(ctx) + [q], max_len=self.max_len)
                 else:
-                    q_ids = self.tokenizer.encode(q, max_len=self.max_len - 1)
+                    q_ids = _encode_nopad(self.tokenizer, q, max_len=self.max_len - 1)
                     src_idx = [config.SPECIAL_TOKENS["<BOS>"]] + q_ids
-                a_ids = self.tokenizer.encode(a, max_len=self.max_len - 1)
+                a_ids = _encode_nopad(self.tokenizer, a, max_len=self.tgt_max_len - 1)
                 tgt_in = [config.SPECIAL_TOKENS["<BOS>"]] + a_ids
                 tgt_out = a_ids + [config.SPECIAL_TOKENS["<EOS>"]]
                 srcs.append(src_idx[: self.max_len])
-                tgt_ins.append(tgt_in[: self.max_len] + [config.SPECIAL_TOKENS["<PAD>"]] * max(0, self.max_len - len(tgt_in)))
-                tgt_outs.append(tgt_out[: self.max_len] + [config.SPECIAL_TOKENS["<PAD>"]] * max(0, self.max_len - len(tgt_out)))
+                tgt_ins.append(tgt_in[: self.tgt_max_len])
+                tgt_outs.append(tgt_out[: self.tgt_max_len])
 
                 intent_name, _ = UnifiedIntentLabeler.label(q)
                 intents.append(UnifiedIntentLabeler.to_index(intent_name))
             T = max(len(s) for s in srcs)
-            src_padded = [s + [config.SPECIAL_TOKENS["<PAD>"]] * (T - len(s)) for s in srcs]
+            T2 = max(len(t) for t in tgt_ins)
+            pad = config.SPECIAL_TOKENS["<PAD>"]
+            src_padded = [s + [pad] * (T - len(s)) for s in srcs]
+            tgt_in_p = [t + [pad] * (T2 - len(t)) for t in tgt_ins]
+            tgt_out_p = [t + [pad] * (T2 - len(t)) for t in tgt_outs]
             yield {
                 "src": torch.tensor(src_padded, dtype=torch.long, device=device),
-                "tgt_in": torch.tensor(tgt_ins, dtype=torch.long, device=device),
-                "tgt_out": torch.tensor(tgt_outs, dtype=torch.long, device=device),
+                "tgt_in": torch.tensor(tgt_in_p, dtype=torch.long, device=device),
+                "tgt_out": torch.tensor(tgt_out_p, dtype=torch.long, device=device),
                 "intents": torch.tensor(intents, dtype=torch.long, device=device),
             }
 
@@ -3800,20 +3911,19 @@ class DataPipeline:
             pack_prob = getattr(config, "CONTENT_PACK_PROB", 0.0)
             max_segs = getattr(config, "CONTENT_PACK_MAX_SEGS", 4)
             for t in chunk:
-                t_ids = self.tokenizer.encode(t, max_len=self.max_len - 1)
+                t_ids = _encode_nopad(self.tokenizer, t, max_len=self.tgt_max_len - 1)
                 if pack_prob and rng.random() < pack_prob and len(texts) > 1:
                     n_ctx = rng.randint(1, max(1, max_segs - 1))
                     extra = rng.sample(texts, min(n_ctx, len(texts)))
                     src_idx = pack_content_segments(
                         self.tokenizer, list(extra) + [t], max_len=self.max_len)
                 else:
-                    src_idx = [config.SPECIAL_TOKENS["<BOS>"]] + t_ids
+                    src_idx = [config.SPECIAL_TOKENS["<BOS>"]] + t_ids[: self.max_len - 1]
                 tgt_in = [config.SPECIAL_TOKENS["<BOS>"]] + t_ids
                 tgt_out = t_ids + [config.SPECIAL_TOKENS["<EOS>"]]
                 srcs.append(src_idx[: self.max_len])
-                # 长度对齐（同一句内 tgt_in == tgt_out 长度）
-                tgt_in = tgt_in[: self.max_len]
-                tgt_out = tgt_out[: self.max_len]
+                tgt_in = tgt_in[: self.tgt_max_len]
+                tgt_out = tgt_out[: self.tgt_max_len]
                 while len(tgt_in) < len(tgt_out):
                     tgt_in.append(config.SPECIAL_TOKENS["<PAD>"])
                 while len(tgt_out) < len(tgt_in):
@@ -4554,6 +4664,10 @@ class UnifiedTrainer:
                 "STAGE": config.STAGE,
             },
             "locked_mask": self.model._locked_mask.cpu().tolist() if self.model._locked_mask is not None else None,
+            "intent_lock_table": (
+                self.model._intent_lock_table.cpu().tolist()
+                if getattr(self.model, "_intent_lock_table", None) is not None else None
+            ),
             "amp_scaler": self.scaler.state_dict() if self.scaler is not None else None,
         }
         # EMA / 最优权重快照：内存里已有，落盘是可选的（Orin 等小内存设备建议关闭）
@@ -4646,6 +4760,13 @@ class UnifiedTrainer:
                 print(f"  [OK] 分化锁定掩码已恢复: {[int(v) for v in locked]}")
             except Exception as e:
                 print(f"  [warn] locked_mask 恢复失败（忽略）: {e}")
+        intent_table = ckpt.get("intent_lock_table")
+        if intent_table is not None:
+            try:
+                self.model._intent_lock_table = torch.tensor(intent_table, dtype=torch.float32, device=device)
+                print(f"  [OK] 按意图锁定表已恢复: {len(intent_table)} 行")
+            except Exception as e:
+                print(f"  [warn] intent_lock_table 恢复失败（忽略）: {e}")
         # AMP：恢复 GradScaler 状态（旧 checkpoint 无该键则保持默认）
         scaler_state = ckpt.get("amp_scaler")
         if scaler_state is not None and self.scaler is not None:
@@ -4685,7 +4806,10 @@ class UnifiedTrainer:
             print(f"  锁定状态: 已固化（硬门控生效）")
             print(f"  边际路由熵: {report['global']['entropy']:.3f}（<0.7 视为充分分化）")
             print(f"  全局载荷: {report['global']['avg_load']}")
-            print(f"  锁定掩码: {report['global']['mask']}（1=允许激活 0=抑制）")
+            print(f"  锁定掩码: {report['global']['mask']}（1=允许激活 0=抑制；情感+生成常驻）")
+            intent_masks = report["global"].get("intent_masks") or {}
+            if intent_masks:
+                print(f"  按意图掩码: {len(intent_masks)} 类")
         else:
             print("  锁定状态: 未固化（数据不足）")
         print("  意图-模块映射:")
@@ -4733,14 +4857,14 @@ class InferenceEngine:
     """安晚对话推理引擎（快轨 / 慢轨 / 模型生成 / 兜底 四层）"""
 
     def __init__(self, model, tokenizer, device="cpu", stage="main",
-                 qa_pairs=None, temperature=0.8, top_p=0.9, max_len=25):
+                 qa_pairs=None, temperature=0.8, top_p=0.9, max_len=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.stage = stage
         self.temperature = temperature
         self.top_p = top_p
-        self.max_len = max_len
+        self.max_len = max_len if max_len is not None else getattr(config, "GEN_MAX_LEN", 256)
 
         # 语料索引（快轨 dict：问句 → 答案列表；慢轨样本：问句/答案全文）
         self._fast_index = {}      # 归一化问句 -> 答案列表
@@ -4855,6 +4979,7 @@ class InferenceEngine:
             strategy="nucleus",
             stage=self.stage,
             prev_emotion_vec=self.emotion_vec,
+            intent_idx=UnifiedIntentLabeler.to_index(intent),
         )
         # 去掉前缀 BOS 与 EOS
         ids_out = [int(i) for i in tokens[0].tolist()][1:]
@@ -6022,6 +6147,8 @@ def cmd_moe_report(args):
     print(f"  检索 TF-1          : 专家 FFN {config.ENC_EXPERTS} 个，Top-{config.ENC_TOP_K}"
           if isinstance(model.tf1, _MoEEncoder) else "  检索 TF-1          : 稠密 FFN（旧行为）")
     print(f"  生成 TF-2          : 专家 FFN {config.NUM_EXPERTS} 个，Top-{config.TOP_K_EXPERTS}")
+    print(f"  前置路由           : 输入摘要+意图+PAD → 4 通道；"
+          f"情感/生成常驻，内容/检索阈值 {config.ROUTER_SKIP_THRESHOLD}")
     if model.lstm_b_semi is not None:
         print(f"  情感 LSTM-B        : 完整模型（隐层 {model.lstm_b_hidden}，持跨轮状态）"
               f" + 半专家 {config.EMO_SEMI_EXPERTS} 个 × {config.EMO_SEMI_EXPERT_HIDDEN}"
