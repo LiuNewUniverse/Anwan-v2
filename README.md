@@ -1,6 +1,6 @@
 # Anwan-v2
 
-安晚一体化统一模型 v2：单文件自包含（训练 + 对话）。规格约 800M 参数。默认内容通道为双向专家 Transformer（标准注意力，手机端可用），一次可打包多段文本；情感通道始终走 LSTM-B 以保持跨轮 `(h, c)`。中央路由前置：看输入摘要、意图、上一轮 PAD 后决定跑哪些通道，情感与生成永不跳过。SSM / LSTM-A 仍可经环境变量回退。
+安晚一体化统一模型 v2：单文件自包含（训练 + 对话）。规格约 1500M 参数。默认内容通道为双向专家 Transformer（标准注意力，手机端可用），一次可打包多段文本；情感通道始终走 LSTM-B 以保持跨轮 `(h, c)`。中央路由前置：看输入摘要、意图、上一轮 PAD 后决定跑哪些通道，情感与生成永不跳过。SSM / LSTM-A 仍可经环境变量回退。每层 MoE 为 DeepSeek 式：共享专家始终在线 + 路由专家 Top-2。
 
 ## 环境
 
@@ -13,7 +13,7 @@
 pip install -r requirements.txt
 ```
 
-GPU 训练建议 Ampere 及以上、显存 16GB+。Orin Nano 8G 可把 `CKPT_SAVE_SHADOWS = False`，并视情况关 AMP 以外的影子权重。
+GPU 训练建议 Ampere 及以上、显存 24GB+。Orin Nano 8G 可把 `CKPT_SAVE_SHADOWS = False`，并视情况关 AMP 以外的影子权重。
 
 ## 目录
 
@@ -64,12 +64,14 @@ python a12.py chat
 
 ## 规格（不降配）
 
-- Embedding 1536；内容通道默认 2 层双向 MoE Transformer（4 专家 Top-2，FFN 1536）
+- Embedding 1536；总量约 1500M。通道比例约：生成 45% / 检索 26% / 内容 19% / 情感 10%
+- 内容：4 层双向 MoE Transformer，每层 8 路由 + 2 共享，Top-2，FFN 2048
 - 一次最多打包 6 段文本（`<SEP>` 分隔 + 段 embedding）；LM/SFT 以 0.4 概率掺入
-- LSTM-B hidden 3600；情感 512 维 + PAD 三维（愉悦 / 唤醒 / 支配）
-- TF-1：5 层；TF-2：4 层 MoE decoder（4 专家 Top-2）
+- LSTM-B hidden 3600；情感 512 维 + PAD 三维（愉悦 / 唤醒 / 支配）；半专家 4 个 Top-1
+- TF-1：6 层，每层 8 路由 + 1 共享，Top-2，FFN 2048
+- TF-2：6 层 decoder，每层 8 路由 + 2 共享，Top-2，FFN 3072
 - 前置通用路由：输入摘要 + 意图 embedding + PAD → 4 通道权重；推理时内容/检索低于 `ROUTER_SKIP_THRESHOLD=0.12` 可跳过；按意图锁定 top-2（情感+生成强制常驻）
-- 词表 32000；输入 `MAX_LEN=256`、训练/生成 `TGT_MAX_LEN=GEN_MAX_LEN=256`（2+5+4 层能稳住的读写上限）；历史 6 轮 / 120 token，记忆单条 48 token
+- 词表 32000；输入 `MAX_LEN=256`、训练/生成 `TGT_MAX_LEN=GEN_MAX_LEN=256`；历史 6 轮 / 120 token，记忆单条 48 token
 - 意图 14 类（含 `lang_learning` / `rare_word`）
 - 回退：`ANWAN_BACKBONE=ssm` 或 `lstm`（LSTM-A hidden 8192 / 专家隐层 4096）
 

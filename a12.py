@@ -121,23 +121,25 @@ LEARNED_PAIRS_NAME = os.path.basename(LEARNED_PAIRS_FILE)              # 落盘�
 
 # ==================== 分词器 ====================
 VOCAB_SIZE = 32000          # 词表大小（方案A(语种子词表)+方案B(全局扩表)融合基线：
-MAX_LEN = 256              # 输入最长 token 数（2 层双向内容编码 + 5 层检索，800M 能稳住的读力上限）
+MAX_LEN = 256              # 输入最长 token 数（4 层内容 + 6 层检索，1500M 浅层能稳住的读力上限）
 SPECIAL_TOKENS = {
     "<PAD>": 0, "<BOS>": 1, "<EOS>": 2, "<UNK>": 3,
     "<SEP>": 4, "<MASK>": 5, "<USER>": 6, "<BOT>": 7,
 }
 BPE_MERGE_CAP = 30000       # BPE 合并轮数上限（32K 词表需要更多合并轮次；语料不足时以实际为准）
 
-# ==================== 模型 (800M 参数规格) ====================
+# ==================== 模型 (1500M 参数规格) ====================
+# 通道比例（约）：生成 45% / 检索 26% / 内容 19% / 情感 10% / 其余 4%。
+# 宽度仍 1536：多出来的量给专家池 + 共享专家，注意力与 256 上下文成本不跟涨。
 EMBED_DIM = 1536           # 共享 embedding 宽度
 LSTM_HIDDEN = 8192         # LSTM-A（内容/无状态）宽度
 LSTM_LAYERS = 1
-LSTM_B_HIDDEN = 3600      # LSTM-B（情感通道）中间宽度（精确调参使总参数≈800M）
-EMOTION_DIM = 512          # 情感维度 (512-d → LSTM 2048 → 512 回传)
+LSTM_B_HIDDEN = 3600      # LSTM-B（情感通道）完整主干宽度；跨轮 (h,c) 仍由它独占
+EMOTION_DIM = 512          # 情感维度 (512-d → LSTM 3600 → 512 回传)
 NUM_HEADS = 12             # TF-1 检索 / TF-2 生成 注意力头数 (1536÷12=128，整除)
-TRANS_LAYERS = 5           # TF-1 编码器层数
-DECODER_LAYERS = 4         # TF-2 解码器层数
-FF_DIM = 6144              # FFN 中间宽度 (4×1536)
+TRANS_LAYERS = 6           # TF-1 编码器层数
+DECODER_LAYERS = 6         # TF-2 解码器层数
+FF_DIM = 6144              # 稠密 FFN 中间宽度（MOE_SCOPE=decoder 回退路径）
 DROPOUT = 0.1
 TIE_WEIGHTS = True         # 输出投影与 shared_embedding 共享权重
 
@@ -192,24 +194,25 @@ EMOTION_AROUSAL = {
 # 受意图监督回归、跨轮连续性约束、随状态持久化，并反哺下一轮生成。
 EMOTION_VEC_DIM = 3
 
-# ---- MoE 轻量混合专家（decoder 层）----
-# 仅在 decoder 启用 MoE：4 个小型专家 + Top-2 路由，每 token 激活 2 个。
-# 专家 FFN = 原 FFN 的一半，总参数量可控，Orin 8G 可承受。
-NUM_EXPERTS = 4              # 专家数量（Orin 8G 安全上限）
-TOP_K_EXPERTS = 2            # Top-2 路由（每 token 只激活 2 个专家）
-EXPERT_FF_DIM = 3072         # 单个专家的 FFN 中间宽度（原 FF_DIM 6144 的一半）
-MOE_LOAD_BALANCE_WEIGHT = 0.01  # 负载均衡 loss 权重（辅助项，小权重防专家坍缩）
+# ---- MoE（DeepSeek 式：共享专家始终在线 + 路由专家 Top-k）----
+# 每层 FFN = 1~2 个共享专家（全体 token 必跑）+ N 个路由专家（每 token Top-2）。
+# 生成最肥、检索次之、内容再次；情感走完整 LSTM-B，不靠堆 FFN。
+NUM_EXPERTS = 8              # TF-2 每层路由专家数
+TOP_K_EXPERTS = 2            # Top-2 路由（每 token 只激活 2 个路由专家）
+NUM_SHARED_EXPERTS = 2       # TF-2 每层共享专家数（始终激活）
+EXPERT_FF_DIM = 3072         # TF-2 单专家 FFN 宽度
+MOE_LOAD_BALANCE_WEIGHT = 0.01  # 负载均衡 loss 权重（只打在路由专家上）
 # ==================== v3 半专家化（全域专家 + 情感半专家）====================
-# 升级口径：不是再加一个新模块，而是把已有 4 条通道统一换成同一套专家化骨架。
-#   · 专家模型（纯 MoE）：内容双向 Transformer / 检索 TF-1 / 生成 TF-2 —— 参数可扩、激活不扩。
+#   · 专家模型：内容 / 检索 / 生成 —— 共享专家保底 + 路由专家扩容，激活量按 Top-k。
 #   · 半专家 + 完整模型：仅情感 LSTM-B —— 完整主干永远通电并独占跨轮 (h,c)，
 #     半专家只做单轮小幅修正，门控带上限，反不了客。
 MOE_SCOPE = os.environ.get("ANWAN_MOE_SCOPE", "all")  # "decoder"=旧行为（仅 TF-2 MoE，稠密）| "all"=全域专家化
 # ---- 内容通道：双向专家 Transformer（默认）/ LSTM-A 专家池（回退）----
-CONTENT_TF_LAYERS = 2          # 内容编码器层数（双向自注意力，每 token 看见整段上下文）
-CONTENT_TF_EXPERTS = 4         # 每层 FFN 专家数
-CONTENT_TF_TOP_K = 2           # 每 token 激活专家数
-CONTENT_TF_FF_DIM = 1536       # 单专家 FFN 宽度（与 TF-1 检索同级，手机端标准算子）
+CONTENT_TF_LAYERS = 4          # 内容编码器层数（双向自注意力，每 token 看见整段上下文）
+CONTENT_TF_EXPERTS = 8         # 每层路由专家数
+CONTENT_TF_TOP_K = 2           # 每 token 激活的路由专家数
+CONTENT_TF_SHARED = 2          # 每层共享专家（通用语言保底）
+CONTENT_TF_FF_DIM = 2048       # 单专家 FFN 宽度
 CONTENT_PACK_MAX_SEGS = 6      # 一次前向最多打包的文本段数（256 上下文可多塞两段）
 CONTENT_PACK_PROB = 0.4        # LM/SFT 把多段文本打进同一 src 的概率
 LSTM_A_EXPERTS = 4             # LSTM 回退：专家个数
@@ -218,13 +221,14 @@ LSTM_A_EXPERT_HIDDEN = 4096    # LSTM 回退：单专家隐层
 LSTM_A_LOAD_BALANCE_WEIGHT = 0.01
 LSTM_A_MIN_LOAD = 0.10            # 单个内容专家的最低平均负载（饥饿下界）
 # ---- TF-1 检索编码器：专家化 FFN ----
-ENC_EXPERTS = 4
+ENC_EXPERTS = 8
 ENC_TOP_K = 2
-ENC_EXPERT_FF_DIM = 1536
+ENC_SHARED = 1                 # 检索偏特化，共享专家少留 1 个
+ENC_EXPERT_FF_DIM = 2048
 ENC_LOAD_BALANCE_WEIGHT = 0.01
 # ---- 情感通道：半专家 + 完整模型 ----
 EMO_FULL_MODEL = True          # 完整模型底座开关（False=退化为纯专家，不建议）
-EMO_SEMI_EXPERTS = 2           # 半专家个数
+EMO_SEMI_EXPERTS = 4           # 半专家个数（人设特化支路）
 EMO_SEMI_TOP_K = 1             # 每轮每序列激活的半专家数
 EMO_SEMI_EXPERT_HIDDEN = 1200  # 半专家隐层（完整 3600 的 1/3）
 EMO_SEMI_GATE_INIT = 0.15      # 半专家支路门控初值（先让完整模型学会说话）
@@ -324,7 +328,7 @@ AWIL_ENABLED_IN_TRAIN = False
 # ==================== 推理 ====================
 TEMPERATURE = 0.8
 TOP_P = 0.9
-TGT_MAX_LEN = 256          # 训练目标最长 token 数（与生成对齐；4 层 MoE decoder 写圆的上限）
+TGT_MAX_LEN = 256          # 训练目标最长 token 数（与生成对齐；6 层 MoE decoder 写圆的上限）
 GEN_MAX_LEN = 256          # 生成最长 token 数（与 TGT_MAX_LEN 对齐；无 KV cache 时再长会空转）
 REPLY_MIN_LEN = 2          # 生成结果低于此长度视为无效，走兜底
 
@@ -1860,55 +1864,57 @@ class _Expert(nn.Module):
 
 
 class _MoELayer(nn.Module):
-    """轻量 MoE 层：Top-k 路由，每 token 只激活 k 个专家。
+    """DeepSeek 式 MoE：共享专家全体 token 必跑 + 路由专家 Top-k。
 
-    与 nn.TransformerDecoderLayer 配合：替换其 FFN 子层，保留
-    多头自注意力 + 交叉注意力不变。aux_loss 在训练时返回供 compute_loss
-    累加，推理时不参与梯度。
+    共享专家学通用变换（语法/常识），路由专家学特化；aux_loss 只打在
+    路由专家上。与注意力层配合替换 FFN。
     """
     def __init__(self, d_model, num_experts=4, top_k=2, expert_ff_dim=2048,
-                 dropout=0.1, aux_loss_weight=0.01):
+                 dropout=0.1, aux_loss_weight=0.01, num_shared=0):
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
         self.top_k = top_k
+        self.num_shared = max(int(num_shared), 0)
         self.aux_loss_weight = aux_loss_weight
-        # 路由门
         self.gate = nn.Linear(d_model, num_experts)
-        # 专家池
         self.experts = nn.ModuleList([
             _Expert(d_model, expert_ff_dim, dropout) for _ in range(num_experts)
         ])
-        self.last_usage = None   # [E] 本 batch 平均路由概率（专家化体检用）
+        self.shared_experts = nn.ModuleList([
+            _Expert(d_model, expert_ff_dim, dropout) for _ in range(self.num_shared)
+        ])
+        self.last_usage = None   # [E] 本 batch 平均路由概率（不含共享专家）
 
     def expert_param_count(self):
         return sum(p.numel() for e in self.experts for p in e.parameters())
+
+    def shared_param_count(self):
+        return sum(p.numel() for e in self.shared_experts for p in e.parameters())
 
     def forward(self, x):
         """x: [B, T, d_model]；返回 (out, aux_loss)。"""
         B, T, D = x.size()
         x_flat = x.view(B * T, D)
-        # 路由分数
-        gate_logits = self.gate(x_flat)                         # [B*T, E]
-        gate_probs = F.softmax(gate_logits, dim=-1)               # [B*T, E]
-        # Top-k + 归一化
-        topk_w, topk_idx = torch.topk(gate_probs, self.top_k, dim=-1)  # [B*T, k]
+        gate_logits = self.gate(x_flat)
+        gate_probs = F.softmax(gate_logits, dim=-1)
+        topk_w, topk_idx = torch.topk(gate_probs, self.top_k, dim=-1)
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-9)
-        # 按专家聚合输入
-        out = torch.zeros_like(x_flat)                            # [B*T, D]
+        out = torch.zeros_like(x_flat)
         for e_id in range(self.num_experts):
-            mask = (topk_idx == e_id)                              # [B*T, k]
+            mask = (topk_idx == e_id)
             if not mask.any():
                 continue
-            tok_idx, k_slot = torch.where(mask)                    # 1-D 索引
-            expert_in = x_flat[tok_idx]                            # [N, D]
-            expert_w = topk_w[tok_idx, k_slot].unsqueeze(-1)       # [N, 1]
-            expert_out = self.experts[e_id](expert_in)             # [N, D]
+            tok_idx, k_slot = torch.where(mask)
+            expert_in = x_flat[tok_idx]
+            expert_w = topk_w[tok_idx, k_slot].unsqueeze(-1)
+            expert_out = self.experts[e_id](expert_in)
             out.index_add_(0, tok_idx, expert_w * expert_out)
+        for shared in self.shared_experts:
+            out = out + shared(x_flat)
         out = out.view(B, T, D)
-        # 负载均衡辅助 loss（鼓励均匀路由）
-        router_prob = gate_probs.mean(dim=0)                       # [E]
-        self.last_usage = router_prob.detach()                # 留在设备上，避免每步 GPU 同步
+        router_prob = gate_probs.mean(dim=0)
+        self.last_usage = router_prob.detach()
         aux_loss = self.num_experts * (router_prob ** 2).sum() - 1.0
         aux_loss = aux_loss.clamp_min(0.0) * self.aux_loss_weight
         return out, aux_loss
@@ -1918,7 +1924,7 @@ class _MoEDecoderLayer(nn.Module):
     """手写 MoE Decoder 层：保留 MultiheadAttention + CrossAttention，
     FFN 替换为 _MoELayer Top-k 专家池（轻量）。"""
     def __init__(self, d_model, nhead, num_experts=4, top_k=2,
-                 expert_ff_dim=2048, dropout=0.1):
+                 expert_ff_dim=2048, dropout=0.1, num_shared=0):
         super().__init__()
         # --- 自注意力 ---
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -1928,7 +1934,8 @@ class _MoEDecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         # --- MoE FFN ---
         self.moe_ffn = _MoELayer(d_model, num_experts, top_k, expert_ff_dim, dropout,
-                                 aux_loss_weight=getattr(config, "MOE_LOAD_BALANCE_WEIGHT", 0.01))
+                                 aux_loss_weight=getattr(config, "MOE_LOAD_BALANCE_WEIGHT", 0.01),
+                                 num_shared=num_shared)
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -1950,7 +1957,7 @@ class _MoEDecoderLayer(nn.Module):
 
 # ==================== v3 半专家化模块（全域专家 + 情感半专家）====================
 # 设计口径（写死在这里，免得日后代码与注释各说各话）：
-#   专家模型（纯 MoE）= 没有常驻主干，每条序列 / 每个 token 只激活 Top-k 个专家。
+#   专家模型（DeepSeek 式 MoE）= 1~2 个共享 FFN 始终在线 + 路由专家每 token Top-k。
 #                       用在内容通道双向 Transformer、检索编码器 TF-1、生成解码器 TF-2。
 #   半专家 + 完整模型   = 一个始终激活的「完整模型」主干 + Top-k 个小得多的半专家，
 #                       半专家只在主干输出上做门控限幅的小幅修正。
@@ -2274,12 +2281,13 @@ class _MoEEncoderLayer(nn.Module):
     """
 
     def __init__(self, d_model, nhead, num_experts=4, top_k=2,
-                 expert_ff_dim=1536, dropout=0.1):
+                 expert_ff_dim=1536, dropout=0.1, num_shared=0):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.moe_ffn = _MoELayer(d_model, num_experts, top_k, expert_ff_dim, dropout,
-                                 aux_loss_weight=getattr(config, "ENC_LOAD_BALANCE_WEIGHT", 0.01))
+                                 aux_loss_weight=getattr(config, "ENC_LOAD_BALANCE_WEIGHT", 0.01),
+                                 num_shared=num_shared)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -2295,10 +2303,11 @@ class _MoEEncoder(nn.Module):
     """专家化编码器（替掉 nn.TransformerEncoder）：forward 多返回一个 aux 合计。"""
 
     def __init__(self, d_model, nhead, num_layers, num_experts=4, top_k=2,
-                 expert_ff_dim=1536, dropout=0.1):
+                 expert_ff_dim=1536, dropout=0.1, num_shared=0):
         super().__init__()
         self.layers = nn.ModuleList([
-            _MoEEncoderLayer(d_model, nhead, num_experts, top_k, expert_ff_dim, dropout)
+            _MoEEncoderLayer(d_model, nhead, num_experts, top_k, expert_ff_dim, dropout,
+                             num_shared=num_shared)
             for _ in range(num_layers)
         ])
 
@@ -2315,7 +2324,7 @@ class ContentMoEBackbone(nn.Module):
     FFN 走 Top-k 专家，注意力是标准 MultiheadAttention（手机端可用）。"""
 
     def __init__(self, d_model, nhead, num_layers=2, num_experts=4, top_k=2,
-                 expert_ff_dim=1536, dropout=0.1, max_segs=4):
+                 expert_ff_dim=1536, dropout=0.1, max_segs=4, num_shared=0):
         super().__init__()
         self.max_segs = max_segs
         self.seg_embed = nn.Embedding(max_segs, d_model)
@@ -2324,6 +2333,7 @@ class ContentMoEBackbone(nn.Module):
             d_model=d_model, nhead=nhead, num_layers=num_layers,
             num_experts=num_experts, top_k=top_k,
             expert_ff_dim=expert_ff_dim, dropout=dropout,
+            num_shared=num_shared,
         )
 
     def forward(self, x, src=None, pad_mask=None):
@@ -2415,6 +2425,7 @@ class UnifiedAnwanModel(nn.Module):
                 expert_ff_dim=getattr(config, "CONTENT_TF_FF_DIM", 1536),
                 dropout=dropout,
                 max_segs=getattr(config, "CONTENT_PACK_MAX_SEGS", 4),
+                num_shared=getattr(config, "CONTENT_TF_SHARED", 0),
             )
             content_dim = embed_dim
             self.content_dim = content_dim
@@ -2443,7 +2454,7 @@ class UnifiedAnwanModel(nn.Module):
             self.content_dim = content_dim
 
         # ---- LSTM-B：情感通道（有状态 / 跨轮 / emotion_dim）----
-        # 800M 规格：emb_proj(1536→512) + LSTM(512→3600) + out_proj(3600→512)
+        # 情感主干：emb_proj(1536→512) + LSTM(512→3600) + out_proj(3600→512)
         self.emb_proj = nn.Linear(embed_dim, emotion_dim)
         self.lstm_b = nn.LSTM(
             emotion_dim, lstm_b_hidden, num_layers=1, batch_first=True, bidirectional=False
@@ -2495,6 +2506,7 @@ class UnifiedAnwanModel(nn.Module):
                 d_model=embed_dim, nhead=num_heads, num_layers=trans_layers,
                 num_experts=config.ENC_EXPERTS, top_k=config.ENC_TOP_K,
                 expert_ff_dim=config.ENC_EXPERT_FF_DIM, dropout=dropout,
+                num_shared=getattr(config, "ENC_SHARED", 0),
             )
         else:
             enc_layer = nn.TransformerEncoderLayer(
@@ -2511,6 +2523,7 @@ class UnifiedAnwanModel(nn.Module):
                 d_model=embed_dim, nhead=num_heads,
                 num_experts=config.NUM_EXPERTS, top_k=config.TOP_K_EXPERTS,
                 expert_ff_dim=config.EXPERT_FF_DIM, dropout=dropout,
+                num_shared=getattr(config, "NUM_SHARED_EXPERTS", 0),
             )
             for _ in range(decoder_layers)
         ])
@@ -3263,14 +3276,13 @@ class UnifiedAnwanModel(nn.Module):
         return info
 
     def count_active_parameters(self):
-        """激活参数量：专家池里没被路由到的专家不计费（Top-k 稀疏的真实收益）。"""
+        """激活参数量：路由专家里没被 Top-k 选中的不计费；共享专家始终计入。"""
         total = self.count_parameters(trainable_only=False)
         saved = 0
         for m in self.modules():
             if isinstance(m, (_ExpertLSTMPool, _SemiExpertLSTM, _MoELayer)):
                 per_expert = m.expert_param_count() / max(m.num_experts, 1)
                 saved += per_expert * max(m.num_experts - m.top_k, 0)
-        # SSM 主干参数不计入"节省"（全激活）
         return total - saved
 
     def count_parameters(self, trainable_only=True):
@@ -4644,7 +4656,7 @@ class UnifiedTrainer:
     # ---------------- checkpoint 管理 ----------------
     def save_checkpoint(self, epoch, stage, val_loss=None):
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
-        # 体积诊断：800M 参数下 model/ema/best/optimizer 四份合计可达约 12GB，
+        # 体积诊断：1500M 参数下 model/ema/best/optimizer 四份合计可达约 24GB，
         # Orin Nano 8G 机器上保存本身就可能失败。打印实际大小 + 提供瘦身开关。
         n_params = sum(p.numel() for p in self.model.parameters())
         est_gb = n_params * 4 * 4 / (1024 ** 3)   # 粗估：4 份 fp32 副本
@@ -6135,7 +6147,8 @@ def cmd_moe_report(args):
     print(f"  MOE_SCOPE          : {model.moe_scope}")
     if getattr(model, "content_tf", None) is not None:
         print(f"  内容通道           : 双向专家 Transformer {config.CONTENT_TF_LAYERS} 层 × "
-              f"{config.CONTENT_TF_EXPERTS} 专家，Top-{config.CONTENT_TF_TOP_K}"
+              f"{config.CONTENT_TF_EXPERTS} 路由 + {getattr(config, 'CONTENT_TF_SHARED', 0)} 共享，"
+              f"Top-{config.CONTENT_TF_TOP_K}"
               f"（可一次打包 {config.CONTENT_PACK_MAX_SEGS} 段）")
     elif model.lstm_a_pool:
         print(f"  内容 LSTM-A        : 纯专家 {config.LSTM_A_EXPERTS} 个 × 隐层 {config.LSTM_A_EXPERT_HIDDEN}"
@@ -6144,9 +6157,13 @@ def cmd_moe_report(args):
         print("  内容通道           : SSM（Mamba2 / S6 回退）")
     else:
         print("  内容 LSTM-A        : 稠密（旧行为）")
-    print(f"  检索 TF-1          : 专家 FFN {config.ENC_EXPERTS} 个，Top-{config.ENC_TOP_K}"
-          if isinstance(model.tf1, _MoEEncoder) else "  检索 TF-1          : 稠密 FFN（旧行为）")
-    print(f"  生成 TF-2          : 专家 FFN {config.NUM_EXPERTS} 个，Top-{config.TOP_K_EXPERTS}")
+    if isinstance(model.tf1, _MoEEncoder):
+        print(f"  检索 TF-1          : {config.ENC_EXPERTS} 路由 + {getattr(config, 'ENC_SHARED', 0)} 共享，"
+              f"Top-{config.ENC_TOP_K}")
+    else:
+        print("  检索 TF-1          : 稠密 FFN（旧行为）")
+    print(f"  生成 TF-2          : {config.NUM_EXPERTS} 路由 + {getattr(config, 'NUM_SHARED_EXPERTS', 0)} 共享，"
+          f"Top-{config.TOP_K_EXPERTS}")
     print(f"  前置路由           : 输入摘要+意图+PAD → 4 通道；"
           f"情感/生成常驻，内容/检索阈值 {config.ROUTER_SKIP_THRESHOLD}")
     if model.lstm_b_semi is not None:
