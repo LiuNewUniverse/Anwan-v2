@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-05
+
+### 1800M 规格
+
+- 总量从约 1500M 拉到约 1800M。宽度仍 1536，增量给专家 FFN 与情感隐层：生成路由 1920 / 共享 3840，检索与内容路由 1280 / 共享 2560，LSTM-B 3600→4096，半专家隐层 1200→1365。通道比例仍约 生成 45% / 检索 26% / 内容 19% / 情感 10%。
+- 旧 checkpoint 的 FFN 宽度 / LSTM-B 隐层对不上，加载时走形状适配截断或丢弃，需续训。
+
+### DeepSeek 式细粒度分化池
+
+- `_MoELayer` 补齐细粒度切分：`MOE_GRANULARITY=2`，生成/检索/内容路由专家 8→16、Top-2→Top-4，路由 FFN 减半；共享专家保持原宽度、全体 token 必跑、不进 gate。
+- 无辅助损失均衡：每专家 `expert_bias`（buffer，无梯度）只加在 top-k 选择分数上，组合权重用原始 gate scores；训练中按 `sign(k/N - load) * γ` 更新。GShard aux 默认关闭（`ANWAN_MOE_AUX_WEIGHT=0`），需要时可再打开。
+- 路由分数可选 softmax / sigmoid（`ANWAN_MOE_GATE_SCORE`）。`moe-report` 打印切分倍数、bias γ、aux 权重和各层 bias。
+- 旧 checkpoint 的专家数 / FFN 宽度 / `gate.bias` 对不上，加载时走形状适配截断或丢弃，需续训。
+
 ## 2026-11-02
 
 ### 1500M + DeepSeek 式共享专家

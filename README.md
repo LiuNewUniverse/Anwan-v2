@@ -1,6 +1,6 @@
 # Anwan-v2
 
-安晚一体化统一模型 v2：单文件自包含（训练 + 对话）。规格约 1500M 参数。默认内容通道为双向专家 Transformer（标准注意力，手机端可用），一次可打包多段文本；情感通道始终走 LSTM-B 以保持跨轮 `(h, c)`。中央路由前置：看输入摘要、意图、上一轮 PAD 后决定跑哪些通道，情感与生成永不跳过。SSM / LSTM-A 仍可经环境变量回退。每层 MoE 为 DeepSeek 式：共享专家始终在线 + 路由专家 Top-2。
+安晚一体化统一模型 v2：单文件自包含（训练 + 对话）。规格约 1800M 参数。默认内容通道为双向专家 Transformer（标准注意力，手机端可用），一次可打包多段文本；情感通道始终走 LSTM-B 以保持跨轮 `(h, c)`。中央路由前置：看输入摘要、意图、上一轮 PAD 后决定跑哪些通道，情感与生成永不跳过。SSM / LSTM-A 仍可经环境变量回退。每层 MoE 为 DeepSeek 式：细粒度路由专家 + 隔离共享专家 + expert-bias 无辅助损失均衡。
 
 ## 环境
 
@@ -58,18 +58,23 @@ python a12.py chat
 | `ANWAN_RETRIEVAL_MODE` | `full` / `facts_only` | 记忆检索模式 |
 | `ANWAN_EMO_DIR_NORM` | `raw` / `std` | 情绪方向 loss 是否对变化率做 z-score |
 | `ANWAN_MOE_SCOPE` | `all` / `decoder` | 全域专家化或仅 decoder MoE |
+| `ANWAN_MOE_AUX_WEIGHT` | float | MoE GShard aux 权重，默认 `0`（关闭） |
+| `ANWAN_MOE_BIAS_SPEED` | float | expert-bias 更新步长 γ，默认 `0.001` |
+| `ANWAN_MOE_GATE_SCORE` | `softmax` / `sigmoid` | 路由分数，默认 softmax |
 | `ANWAN_EMOTION_STATE_MAX_NORM` | float | 情感状态范数上限，越界重置 |
 | `ANWAN_EMOTION_AROUSAL_MARGIN` | float | 高低唤醒相对分离度边距 |
 | `ANWAN_EMOTION_DECAY_DAYS` | float | 离线情感衰减半衰期（天） |
 
 ## 规格（不降配）
 
-- Embedding 1536；总量约 1500M。通道比例约：生成 45% / 检索 26% / 内容 19% / 情感 10%
-- 内容：4 层双向 MoE Transformer，每层 8 路由 + 2 共享，Top-2，FFN 2048
+- Embedding 1536；总量约 1800M。通道比例约：生成 45% / 检索 26% / 内容 19% / 情感 10%
+- 内容：4 层双向 MoE Transformer，每层 16 路由 + 2 共享，Top-4，路由 FFN 1280 / 共享 FFN 2560
 - 一次最多打包 6 段文本（`<SEP>` 分隔 + 段 embedding）；LM/SFT 以 0.4 概率掺入
-- LSTM-B hidden 3600；情感 512 维 + PAD 三维（愉悦 / 唤醒 / 支配）；半专家 4 个 Top-1
-- TF-1：6 层，每层 8 路由 + 1 共享，Top-2，FFN 2048
-- TF-2：6 层 decoder，每层 8 路由 + 2 共享，Top-2，FFN 3072
+- LSTM-B hidden 4096；情感 512 维 + PAD 三维（愉悦 / 唤醒 / 支配）；半专家 4 个 × 1365 Top-1
+- TF-1：6 层，每层 16 路由 + 1 共享，Top-4，路由 FFN 1280 / 共享 FFN 2560
+- TF-2：6 层 decoder，每层 16 路由 + 2 共享，Top-4，路由 FFN 1920 / 共享 FFN 3840
+- 细粒度切分 `MOE_GRANULARITY=2`：路由专家数与 Top-k ×2、路由 FFN /2，激活 FLOPs 近似不变；共享专家隔离、不进 gate
+- 均衡默认 expert-bias（只改 top-k 选择）；aux 默认关闭，旧 checkpoint 形状不兼容时截断/丢弃，需续训
 - 前置通用路由：输入摘要 + 意图 embedding + PAD → 4 通道权重；推理时内容/检索低于 `ROUTER_SKIP_THRESHOLD=0.12` 可跳过；按意图锁定 top-2（情感+生成强制常驻）
 - 词表 32000；输入 `MAX_LEN=256`、训练/生成 `TGT_MAX_LEN=GEN_MAX_LEN=256`；历史 6 轮 / 120 token，记忆单条 48 token
 - 意图 14 类（含 `lang_learning` / `rare_word`）
