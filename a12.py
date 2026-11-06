@@ -194,15 +194,16 @@ EMOTION_AROUSAL = {
 # 受意图监督回归、跨轮连续性约束、随状态持久化，并反哺下一轮生成。
 EMOTION_VEC_DIM = 3
 
-# ---- MoE（DeepSeek 式：细粒度切分 + 共享专家隔离 + 无辅助损失均衡）----
-# 细粒度：原专家按 MOE_GRANULARITY 切开，FFN 变窄、专家变多、Top-k 同比放大，激活 FLOPs 近似不变。
+# ---- MoE（DeepSeek 式：细粒度切分 + 共享专家隔离 + 动态开关 + 无辅助损失均衡）----
+# 细粒度：原专家按 MOE_GRANULARITY 切开，FFN 变窄、专家变多，激活量随动态 k 变。
 # 共享专家与路由专家完全隔离：全体 token 必跑，不进 gate。
-# 均衡默认走 DeepSeek-V3 expert bias（只改 top-k 选择，不进组合权重、无梯度）；
+# 路由专家按分数开关：低于相对最高分阈值关闭；softmax 下最高 logit 不过 abs 则全关。
+# 均衡默认走 DeepSeek-V3 expert bias（只改开关选择，不进组合权重、无梯度）；
 # aux GShard 项默认关闭，ANWAN_MOE_AUX_WEIGHT>0 时作为可选项。
 # 生成最肥、检索次之、内容再次；情感走完整 LSTM-B，不靠堆 FFN。
-MOE_GRANULARITY = 2          # 细粒度切分倍数（专家数×m、Top-k×m、FFN/m）
+MOE_GRANULARITY = 2          # 细粒度切分倍数（专家数×m、FFN/m）
 NUM_EXPERTS = 16             # TF-2 每层路由专家数（8×m）
-TOP_K_EXPERTS = 4            # Top-k 路由（2×m）
+TOP_K_EXPERTS = 4            # 动态开关关闭时的固定 k；开启时仅作激活量回退估计
 NUM_SHARED_EXPERTS = 2       # TF-2 每层共享专家数（隔离、始终激活，不随 m 放大）
 EXPERT_FF_DIM = 1920         # TF-2 路由专家 FFN 宽度（3840/m）
 SHARED_FF_DIM = 3840         # TF-2 共享专家保持切分前宽度，不随细粒度切分变窄
@@ -215,15 +216,26 @@ try:
 except ValueError:
     MOE_BIAS_UPDATE_SPEED = 0.001
 MOE_GATE_SCORE = os.environ.get("ANWAN_MOE_GATE_SCORE", "softmax")  # softmax | sigmoid
+MOE_DYNAMIC = os.environ.get("ANWAN_MOE_DYNAMIC", "1").strip() not in ("0", "false", "False")
+MOE_MIN_K = 0                # 路由专家可全关（只留共享专家）
+MOE_MAX_K = 0                # 0=上限等于专家数（可全开）；>0 时封顶
+try:
+    MOE_REL_THRESHOLD = float(os.environ.get("ANWAN_MOE_REL_THRESHOLD", "0.40"))
+except ValueError:
+    MOE_REL_THRESHOLD = 0.40
+try:
+    MOE_ABS_THRESHOLD = float(os.environ.get("ANWAN_MOE_ABS_THRESHOLD", "0.0"))
+except ValueError:
+    MOE_ABS_THRESHOLD = 0.0
 # ==================== v3 半专家化（全域专家 + 情感半专家）====================
-#   · 专家模型：内容 / 检索 / 生成 —— 隔离共享专家保底 + 细粒度路由专家 Top-k。
+#   · 专家模型：内容 / 检索 / 生成 —— 隔离共享专家保底 + 细粒度路由专家动态开关。
 #   · 半专家 + 完整模型：仅情感 LSTM-B —— 完整主干永远通电并独占跨轮 (h,c)，
 #     半专家只做单轮小幅修正，门控带上限，反不了客。
 MOE_SCOPE = os.environ.get("ANWAN_MOE_SCOPE", "all")  # "decoder"=旧行为（仅 TF-2 MoE，稠密）| "all"=全域专家化
 # ---- 内容通道：双向专家 Transformer（默认）/ LSTM-A 专家池（回退）----
 CONTENT_TF_LAYERS = 4          # 内容编码器层数（双向自注意力，每 token 看见整段上下文）
 CONTENT_TF_EXPERTS = 16        # 每层路由专家数（8×m）
-CONTENT_TF_TOP_K = 4           # 每 token 激活的路由专家数（2×m）
+CONTENT_TF_TOP_K = 4           # 动态关闭时的固定 k；开启时仅作激活量回退估计
 CONTENT_TF_SHARED = 2          # 每层共享专家（隔离、通用语言保底）
 CONTENT_TF_FF_DIM = 1280       # 路由专家 FFN 宽度（2560/m）
 CONTENT_TF_SHARED_FF_DIM = 2560  # 共享专家保持切分前宽度
@@ -292,8 +304,9 @@ NUM_MODULES = 4            # 内容 Transformer / LSTM-B 情感 / TF-1 检索 / 
 ROUTER_ENTROPY_WEIGHT = 0.1  # 熵正则系数（防路由坍缩；>0 鼓励 soft 组合不垄断）
 ROUTER_ENTROPY_FLOOR = 0.8   # 熵下限：batch 边际路由熵低于此值才开始惩罚
 ROUTER_HIDDEN = 256          # 前置路由 MLP 隐层
-ROUTER_SKIP_THRESHOLD = 0.12 # 推理时内容/检索权重低于此值则跳过该通道
-ROUTER_ALWAYS_ON = (1, 3)    # 情感(1)、生成(3)永不跳过
+ROUTER_SKIP_THRESHOLD = 0.06 # 推理时检索权重低于此值则跳过该通道
+ROUTER_ALWAYS_ON = (0, 1, 3) # 内容(0)、情感(1)、生成(3)永不跳过；检索仍可按阈值跳过
+ROUTER_LOCK_TOP_K = 3        # 按意图锁定通道数（情感+生成+内容常驻，检索可挤进第 3 席）
 STAGE = "main"             # "main": 仅对角主通路（内容↔检索、情感↔生成）
                            # "cross": 开放交叉辅通路（内容→生成、情感→检索），弱门控起步
 CROSS_GATE_INIT = 0.1      # 交叉辅通路门控初始值（弱门控）
@@ -1882,11 +1895,11 @@ class _Expert(nn.Module):
 
 
 class _MoELayer(nn.Module):
-    """DeepSeek 式 MoE：细粒度路由专家 Top-k + 隔离共享专家 + 无辅助损失均衡。
+    """DeepSeek 式 MoE：动态开关路由专家 + 隔离共享专家 + 无辅助损失均衡。
 
     共享专家学通用变换（语法/常识），全体 token 必跑、不进 gate。
-    路由专家学特化；top-k 用 scores+bias 选择，组合权重只用原始 scores。
-    expert_bias 无梯度，按负载符号更新；aux GShard 仅当 aux_loss_weight>0。
+    路由专家按分数开关：低于相对/绝对阈值关闭，难样本可全开，简单样本可全关。
+    组合权重只用原始 scores；expert_bias 无梯度，按相对平均负载更新。
     """
     def __init__(self, d_model, num_experts=4, top_k=2, expert_ff_dim=2048,
                  dropout=0.1, aux_loss_weight=0.01, num_shared=0, shared_ff_dim=None):
@@ -1898,6 +1911,15 @@ class _MoELayer(nn.Module):
         self.aux_loss_weight = aux_loss_weight
         self.bias_update_speed = float(getattr(config, "MOE_BIAS_UPDATE_SPEED", 0.001))
         self.gate_score = str(getattr(config, "MOE_GATE_SCORE", "softmax")).lower()
+        self.dynamic = bool(getattr(config, "MOE_DYNAMIC", True))
+        self.min_k = max(int(getattr(config, "MOE_MIN_K", 0)), 0)
+        cfg_max = int(getattr(config, "MOE_MAX_K", 0))
+        self.max_k = num_experts if cfg_max <= 0 else min(cfg_max, num_experts)
+        if not self.dynamic:
+            self.min_k = self.top_k
+            self.max_k = self.top_k
+        self.rel_threshold = float(getattr(config, "MOE_REL_THRESHOLD", 0.40))
+        self.abs_threshold = float(getattr(config, "MOE_ABS_THRESHOLD", 0.0))
         shared_ff = expert_ff_dim if shared_ff_dim is None else shared_ff_dim
         self.gate = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList([
@@ -1909,6 +1931,7 @@ class _MoELayer(nn.Module):
         self.register_buffer("expert_bias", torch.zeros(num_experts))
         self.last_usage = None
         self.last_load = None
+        self.last_k_mean = None
 
     def expert_param_count(self):
         return sum(p.numel() for e in self.experts for p in e.parameters())
@@ -1924,9 +1947,44 @@ class _MoELayer(nn.Module):
     def _update_expert_bias(self, load):
         if (not self.training) or self.bias_update_speed <= 0:
             return
-        target = float(self.top_k) / float(max(self.num_experts, 1))
+        target = load.detach().mean()
         self.expert_bias.add_(
             torch.sign(target - load.detach()) * self.bias_update_speed)
+
+    def _select_experts(self, scores_for_choice, gate_logits=None):
+        """每 token 动态开关：keep [N, E] bool。可全关（全 False）或全开。"""
+        n_tok, n_exp = scores_for_choice.size()
+        min_k = min(self.min_k, n_exp)
+        max_k = min(max(self.max_k, min_k), n_exp)
+        if (not self.dynamic) or (min_k == max_k and min_k > 0):
+            k = min(max(max_k, 1), n_exp)
+            idx = torch.topk(scores_for_choice, k, dim=-1).indices
+            keep = torch.zeros(n_tok, n_exp, dtype=torch.bool, device=scores_for_choice.device)
+            keep.scatter_(-1, idx, True)
+            return keep
+        top_score = scores_for_choice.max(dim=-1, keepdim=True).values
+        thr = top_score * self.rel_threshold
+        if self.gate_score == "sigmoid" and self.abs_threshold > 0:
+            thr = thr.clamp(min=self.abs_threshold)
+        keep = scores_for_choice >= thr
+        if min_k == 0:
+            if self.gate_score == "sigmoid":
+                if self.abs_threshold > 0:
+                    keep = keep & (top_score > self.abs_threshold)
+            elif gate_logits is not None:
+                logit_max = gate_logits.max(dim=-1, keepdim=True).values
+                keep = keep & (logit_max > self.abs_threshold)
+        else:
+            min_idx = torch.topk(scores_for_choice, min_k, dim=-1).indices
+            keep.scatter_(-1, min_idx, True)
+        k_count = keep.sum(dim=-1)
+        over = k_count > max_k
+        if over.any():
+            tight_idx = torch.topk(scores_for_choice, max_k, dim=-1).indices
+            tight = torch.zeros_like(keep)
+            tight.scatter_(-1, tight_idx, True)
+            keep = torch.where(over.unsqueeze(-1), tight, keep)
+        return keep
 
     def forward(self, x):
         """x: [B, T, d_model]；返回 (out, aux_loss)。"""
@@ -1936,28 +1994,28 @@ class _MoELayer(nn.Module):
         gate_logits = self.gate(x_flat)
         gate_scores = self._gate_scores(gate_logits)
         scores_for_choice = gate_scores + self.expert_bias.to(dtype=gate_scores.dtype)
-        topk_idx = torch.topk(scores_for_choice, self.top_k, dim=-1).indices
-        topk_w = gate_scores.gather(-1, topk_idx)
-        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-9)
+        keep = self._select_experts(scores_for_choice, gate_logits=gate_logits)
+        kept_scores = gate_scores * keep.to(dtype=gate_scores.dtype)
+        denom = kept_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        norm_w = kept_scores / denom
         routed = torch.zeros_like(x_flat)
-        ones = gate_scores.new_ones(n_tok)
         load = gate_scores.new_zeros(self.num_experts)
         for e_id in range(self.num_experts):
-            mask = (topk_idx == e_id)
-            if not mask.any():
+            tok_idx = keep[:, e_id].nonzero(as_tuple=True)[0]
+            if tok_idx.numel() == 0:
                 continue
-            tok_idx, k_slot = torch.where(mask)
-            expert_in = x_flat[tok_idx]
-            expert_w = topk_w[tok_idx, k_slot].unsqueeze(-1)
-            expert_out = self.experts[e_id](expert_in)
+            expert_out = self.experts[e_id](x_flat.index_select(0, tok_idx))
+            expert_w = norm_w.index_select(0, tok_idx)[:, e_id].unsqueeze(-1)
             routed.index_add_(0, tok_idx, expert_w * expert_out)
-            load[e_id] = ones.index_select(0, tok_idx).sum() / max(n_tok, 1)
+            load[e_id] = tok_idx.numel() / max(n_tok, 1)
         shared_out = torch.zeros_like(x_flat)
         for shared in self.shared_experts:
             shared_out = shared_out + shared(x_flat)
         out = (routed + shared_out).view(B, T, D)
+        k_mean = keep.to(dtype=gate_scores.dtype).sum(dim=-1).mean()
         self.last_usage = load.detach()
         self.last_load = load.detach()
+        self.last_k_mean = k_mean.detach()
         self._update_expert_bias(load)
         if self.aux_loss_weight > 0:
             aux_loss = _load_balance_aux(
@@ -1969,7 +2027,7 @@ class _MoELayer(nn.Module):
 
 class _MoEDecoderLayer(nn.Module):
     """手写 MoE Decoder 层：保留 MultiheadAttention + CrossAttention，
-    FFN 替换为 _MoELayer 细粒度 Top-k 专家池。"""
+    FFN 替换为 _MoELayer 动态开关专家池。"""
     def __init__(self, d_model, nhead, num_experts=4, top_k=2,
                  expert_ff_dim=2048, dropout=0.1, num_shared=0, shared_ff_dim=None):
         super().__init__()
@@ -2004,7 +2062,7 @@ class _MoEDecoderLayer(nn.Module):
 
 # ==================== v3 半专家化模块（全域专家 + 情感半专家）====================
 # 设计口径（写死在这里，免得日后代码与注释各说各话）：
-#   专家模型（DeepSeek 式 MoE）= 隔离共享 FFN 始终在线 + 细粒度路由专家每 token Top-k，
+#   专家模型（DeepSeek 式 MoE）= 隔离共享 FFN 始终在线 + 细粒度路由专家按分数动态开关，
 #                       均衡默认走 expert bias（aux 可选）。
 #                       用在内容通道双向 Transformer、检索编码器 TF-1、生成解码器 TF-2。
 #   半专家 + 完整模型   = 一个始终激活的「完整模型」主干 + Top-k 个小得多的半专家，
@@ -2322,7 +2380,7 @@ class _SemiExpertLSTM(nn.Module):
 
 
 class _MoEEncoderLayer(nn.Module):
-    """TF-1 检索编码器层（专家化）：多头自注意力 + Top-k 专家 FFN。
+    """TF-1 检索编码器层（专家化）：多头自注意力 + 动态开关专家 FFN。
     与 _MoEDecoderLayer 同一套专家骨架，只是没有交叉注意力 —— 这样
     「检索」和「生成」两条通道的专家分工能在同一语义下互相比较。
     """
@@ -2368,7 +2426,7 @@ class _MoEEncoder(nn.Module):
 
 class ContentMoEBackbone(nn.Module):
     """内容通道：双向专家 Transformer。每 token 看见整段上下文（含多段打包），
-    FFN 走 Top-k 专家，注意力是标准 MultiheadAttention（手机端可用）。"""
+    FFN 走动态开关专家，注意力是标准 MultiheadAttention（手机端可用）。"""
 
     def __init__(self, d_model, nhead, num_layers=2, num_experts=4, top_k=2,
                  expert_ff_dim=1536, dropout=0.1, max_segs=4, num_shared=0,
@@ -2549,7 +2607,7 @@ class UnifiedAnwanModel(nn.Module):
         self.emotion_proj = nn.Linear(emotion_dim, embed_dim)
 
         # ---- TF-1：检索编码器 ----
-        # ---- TF-1：检索编码器（v3：FFN 换成 Top-k 专家池）----
+        # ---- TF-1：检索编码器（v3：FFN 换成动态开关专家池）----
         if self.moe_scope == "all":
             self.tf1 = _MoEEncoder(
                 d_model=embed_dim, nhead=num_heads, num_layers=trans_layers,
@@ -2566,7 +2624,7 @@ class UnifiedAnwanModel(nn.Module):
             self.tf1 = nn.TransformerEncoder(enc_layer, num_layers=trans_layers)
 
         # ---- TF-2：生成解码器（MoE 版）----
-        # 每 decoder 层保留自注意力+交叉注意力，FFN 替换为 Top-k 专家池（轻量）。
+        # 每 decoder 层保留自注意力+交叉注意力，FFN 替换为动态开关专家池。
         # 不继承 nn.TransformerDecoderLayer（避免冗余线性层参数），直接手写。
         self.tf2 = nn.ModuleList([
             _MoEDecoderLayer(
@@ -2645,7 +2703,7 @@ class UnifiedAnwanModel(nn.Module):
 
     def _always_on_mask(self, device, dtype):
         mask = torch.zeros(4, device=device, dtype=dtype)
-        for idx in getattr(config, "ROUTER_ALWAYS_ON", (1, 3)):
+        for idx in getattr(config, "ROUTER_ALWAYS_ON", (0, 1, 3)):
             mask[int(idx)] = 1.0
         return mask
 
@@ -2735,16 +2793,16 @@ class UnifiedAnwanModel(nn.Module):
 
     def channel_active(self, weights, idx):
         """该通道本步是否要算。情感/生成永远 True；训练期全开以便梯度到达 router。"""
-        if int(idx) in getattr(config, "ROUTER_ALWAYS_ON", (1, 3)):
+        if int(idx) in getattr(config, "ROUTER_ALWAYS_ON", (0, 1, 3)):
             return True
         if self.training:
             return True
-        thr = float(getattr(config, "ROUTER_SKIP_THRESHOLD", 0.12))
+        thr = float(getattr(config, "ROUTER_SKIP_THRESHOLD", 0.06))
         return bool((weights[:, int(idx)] >= thr).any().item())
 
     @torch.no_grad()
     def lock_specialization(self, tokenizer, texts_by_intent, device="cpu"):
-        """按意图固化通道掩码：每类意图取平均路由的 top-2，情感+生成强制常驻。"""
+        """按意图固化通道掩码：每类意图取平均路由的 top-k，内容+情感+生成强制常驻。"""
         self.eval()
         report = {"intents": {}, "global": {"entropy": None, "locked": False}}
         if not texts_by_intent:
@@ -2777,8 +2835,9 @@ class UnifiedAnwanModel(nn.Module):
                 "top_weight": float(avg[top]),
                 "weights": [float(v) for v in avg],
             }
+            lock_k = min(int(getattr(config, "ROUTER_LOCK_TOP_K", 3)), 4)
             row = torch.zeros(4)
-            row[avg.topk(2).indices] = 1.0
+            row[avg.topk(lock_k).indices] = 1.0
             row = torch.maximum(row, always.cpu())
             if intent in name_to_idx:
                 table[name_to_idx[intent]] = row.to(device)
@@ -2787,8 +2846,9 @@ class UnifiedAnwanModel(nn.Module):
             global_avg = torch.stack(all_ws).mean(dim=0)
             report["global"]["entropy"] = float(-(global_avg * torch.log(global_avg.clamp_min(1e-9))).sum())
             report["global"]["avg_load"] = [float(v) for v in global_avg]
+            lock_k = min(int(getattr(config, "ROUTER_LOCK_TOP_K", 3)), 4)
             mask = torch.zeros(4, device=device)
-            mask[global_avg.topk(2).indices] = 1.0
+            mask[global_avg.topk(lock_k).indices] = 1.0
             mask = torch.maximum(mask, always)
             self._locked_mask = mask
             for i in range(self.num_intents):
@@ -3317,28 +3377,46 @@ class UnifiedAnwanModel(nn.Module):
                 rows.append(None if b is None else [round(v, 4) for v in b.detach().cpu().tolist()])
             return rows
 
+        def _k_of(layers):
+            rows = []
+            for l in layers:
+                k = getattr(l.moe_ffn, "last_k_mean", None)
+                rows.append(None if k is None else round(float(k.detach().cpu()), 3))
+            return rows
+
         ctf = getattr(self, "content_tf", None)
         if ctf is not None:
             info["content_tf"] = _usage_of(ctf.encoder.layers)
             info["content_tf_bias"] = _bias_of(ctf.encoder.layers)
+            info["content_tf_k"] = _k_of(ctf.encoder.layers)
         if isinstance(self.tf1, _MoEEncoder):
             info["tf1"] = _usage_of(self.tf1.layers)
             info["tf1_bias"] = _bias_of(self.tf1.layers)
+            info["tf1_k"] = _k_of(self.tf1.layers)
         info["tf2"] = _usage_of(self.tf2)
         info["tf2_bias"] = _bias_of(self.tf2)
+        info["tf2_k"] = _k_of(self.tf2)
         last_w = getattr(self, "_last_router_weights", None)
         if last_w is not None:
             info["router"] = [round(v, 4) for v in last_w]
         return info
 
     def count_active_parameters(self):
-        """激活参数量：路由专家里没被 Top-k 选中的不计费；共享专家始终计入。"""
+        """激活参数量：未选中的路由专家不计费；共享专家始终计入。动态 k 用本步平均开启数。"""
         total = self.count_parameters(trainable_only=False)
         saved = 0
         for m in self.modules():
-            if isinstance(m, (_ExpertLSTMPool, _SemiExpertLSTM, _MoELayer)):
+            if isinstance(m, (_ExpertLSTMPool, _SemiExpertLSTM)):
                 per_expert = m.expert_param_count() / max(m.num_experts, 1)
                 saved += per_expert * max(m.num_experts - m.top_k, 0)
+            elif isinstance(m, _MoELayer):
+                per_expert = m.expert_param_count() / max(m.num_experts, 1)
+                k = m.last_k_mean
+                if k is None:
+                    k = float(m.top_k)
+                else:
+                    k = float(k.detach().cpu())
+                saved += per_expert * max(m.num_experts - k, 0.0)
         return total - saved
 
     def count_parameters(self, trainable_only=True):
@@ -4629,9 +4707,9 @@ class UnifiedTrainer:
         print(f"\n[stage={path_stage}] 批次: 训练 {len(train_batches)} / 验证 {len(val_batches)}")
 
         for epoch in range(1, epochs + 1):
-            # 竞争强度衰减：早期 soft（temp=1.0, weight=0.05），后期趋近 WTA（temp=0.3, weight=0.5）
-            temp = max(0.3, 1.0 - (epoch - 1) / max(epochs, 1) * 0.7)
-            comp_weight = min(0.5, 0.05 + (epoch - 1) / max(epochs, 1) * 0.45)
+            # 竞争强度衰减：早期 soft（temp=1.0, weight=0.05），后期收到 0.55（保留多通道峰值）
+            temp = max(0.55, 1.0 - (epoch - 1) / max(epochs, 1) * 0.45)
+            comp_weight = min(0.35, 0.05 + (epoch - 1) / max(epochs, 1) * 0.30)
             self.model._competition_temp = temp
             self.model._competition_weight = comp_weight
             # emo_state 在 _run_epoch 内部是局部变量，每个 epoch 独立起链：
@@ -4874,7 +4952,7 @@ class UnifiedTrainer:
             print(f"  锁定状态: 已固化（硬门控生效）")
             print(f"  边际路由熵: {report['global']['entropy']:.3f}（<0.7 视为充分分化）")
             print(f"  全局载荷: {report['global']['avg_load']}")
-            print(f"  锁定掩码: {report['global']['mask']}（1=允许激活 0=抑制；情感+生成常驻）")
+            print(f"  锁定掩码: {report['global']['mask']}（1=允许激活 0=抑制；内容+情感+生成常驻）")
             intent_masks = report["global"].get("intent_masks") or {}
             if intent_masks:
                 print(f"  按意图掩码: {len(intent_masks)} 类")
@@ -6202,14 +6280,19 @@ def cmd_moe_report(args):
     print("\n  === v3 专家化体检 ===")
     print(f"  MOE_SCOPE          : {model.moe_scope}")
     print(f"  细粒度切分         : ×{getattr(config, 'MOE_GRANULARITY', 1)}"
-          f"（路由专家×m、Top-k×m、FFN/m；共享专家隔离不切）")
+          f"（路由专家×m、FFN/m；共享专家隔离不切）")
+    print(f"  动态路由           : {'开' if getattr(config, 'MOE_DYNAMIC', True) else '关'}"
+          f"  k∈[{getattr(config, 'MOE_MIN_K', 0)}, "
+          f"{'E' if int(getattr(config, 'MOE_MAX_K', 0)) <= 0 else getattr(config, 'MOE_MAX_K', 0)}]"
+          f"  rel≥{getattr(config, 'MOE_REL_THRESHOLD', 0.40)}"
+          f"  abs≥{getattr(config, 'MOE_ABS_THRESHOLD', 0.0)}")
     print(f"  均衡               : expert-bias γ={getattr(config, 'MOE_BIAS_UPDATE_SPEED', 0.0)}"
           f"  score={getattr(config, 'MOE_GATE_SCORE', 'softmax')}"
           f"  aux={getattr(config, 'MOE_LOAD_BALANCE_WEIGHT', 0.0)}")
     if getattr(model, "content_tf", None) is not None:
         print(f"  内容通道           : 双向专家 Transformer {config.CONTENT_TF_LAYERS} 层 × "
               f"{config.CONTENT_TF_EXPERTS} 路由 + {getattr(config, 'CONTENT_TF_SHARED', 0)} 共享，"
-              f"Top-{config.CONTENT_TF_TOP_K}，路由 FFN {config.CONTENT_TF_FF_DIM}"
+              f"动态 k（参考 Top-{config.CONTENT_TF_TOP_K}），路由 FFN {config.CONTENT_TF_FF_DIM}"
               f" / 共享 FFN {getattr(config, 'CONTENT_TF_SHARED_FF_DIM', config.CONTENT_TF_FF_DIM)}"
               f"（可一次打包 {config.CONTENT_PACK_MAX_SEGS} 段）")
     elif model.lstm_a_pool:
@@ -6221,15 +6304,16 @@ def cmd_moe_report(args):
         print("  内容 LSTM-A        : 稠密（旧行为）")
     if isinstance(model.tf1, _MoEEncoder):
         print(f"  检索 TF-1          : {config.ENC_EXPERTS} 路由 + {getattr(config, 'ENC_SHARED', 0)} 共享，"
-              f"Top-{config.ENC_TOP_K}，路由 FFN {config.ENC_EXPERT_FF_DIM}"
+              f"动态 k（参考 Top-{config.ENC_TOP_K}），路由 FFN {config.ENC_EXPERT_FF_DIM}"
               f" / 共享 FFN {getattr(config, 'ENC_SHARED_FF_DIM', config.ENC_EXPERT_FF_DIM)}")
     else:
         print("  检索 TF-1          : 稠密 FFN（旧行为）")
     print(f"  生成 TF-2          : {config.NUM_EXPERTS} 路由 + {getattr(config, 'NUM_SHARED_EXPERTS', 0)} 共享，"
-          f"Top-{config.TOP_K_EXPERTS}，路由 FFN {config.EXPERT_FF_DIM}"
+          f"动态 k（参考 Top-{config.TOP_K_EXPERTS}），路由 FFN {config.EXPERT_FF_DIM}"
           f" / 共享 FFN {getattr(config, 'SHARED_FF_DIM', config.EXPERT_FF_DIM)}")
     print(f"  前置路由           : 输入摘要+意图+PAD → 4 通道；"
-          f"情感/生成常驻，内容/检索阈值 {config.ROUTER_SKIP_THRESHOLD}")
+          f"内容/情感/生成常驻，检索阈值 {config.ROUTER_SKIP_THRESHOLD}，"
+          f"锁定 Top-{getattr(config, 'ROUTER_LOCK_TOP_K', 3)}")
     if model.lstm_b_semi is not None:
         print(f"  情感 LSTM-B        : 完整模型（隐层 {model.lstm_b_hidden}，持跨轮状态）"
               f" + 半专家 {config.EMO_SEMI_EXPERTS} 个 × {config.EMO_SEMI_EXPERT_HIDDEN}"

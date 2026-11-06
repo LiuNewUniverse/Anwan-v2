@@ -61,6 +61,9 @@ python a12.py chat
 | `ANWAN_MOE_AUX_WEIGHT` | float | MoE GShard aux 权重，默认 `0`（关闭） |
 | `ANWAN_MOE_BIAS_SPEED` | float | expert-bias 更新步长 γ，默认 `0.001` |
 | `ANWAN_MOE_GATE_SCORE` | `softmax` / `sigmoid` | 路由分数，默认 softmax |
+| `ANWAN_MOE_DYNAMIC` | `1` / `0` | 专家动态开关，默认开 |
+| `ANWAN_MOE_REL_THRESHOLD` | float | 相对最高分阈值，默认 `0.40` |
+| `ANWAN_MOE_ABS_THRESHOLD` | float | 绝对分数下限，默认 `0` |
 | `ANWAN_EMOTION_STATE_MAX_NORM` | float | 情感状态范数上限，越界重置 |
 | `ANWAN_EMOTION_AROUSAL_MARGIN` | float | 高低唤醒相对分离度边距 |
 | `ANWAN_EMOTION_DECAY_DAYS` | float | 离线情感衰减半衰期（天） |
@@ -68,14 +71,14 @@ python a12.py chat
 ## 规格（不降配）
 
 - Embedding 1536；总量约 1800M。通道比例约：生成 45% / 检索 26% / 内容 19% / 情感 10%
-- 内容：4 层双向 MoE Transformer，每层 16 路由 + 2 共享，Top-4，路由 FFN 1280 / 共享 FFN 2560
+- 内容：4 层双向 MoE Transformer，每层 16 路由 + 2 共享，动态开关（可全关/全开），路由 FFN 1280 / 共享 FFN 2560
 - 一次最多打包 6 段文本（`<SEP>` 分隔 + 段 embedding）；LM/SFT 以 0.4 概率掺入
 - LSTM-B hidden 4096；情感 512 维 + PAD 三维（愉悦 / 唤醒 / 支配）；半专家 4 个 × 1365 Top-1
-- TF-1：6 层，每层 16 路由 + 1 共享，Top-4，路由 FFN 1280 / 共享 FFN 2560
-- TF-2：6 层 decoder，每层 16 路由 + 2 共享，Top-4，路由 FFN 1920 / 共享 FFN 3840
-- 细粒度切分 `MOE_GRANULARITY=2`：路由专家数与 Top-k ×2、路由 FFN /2，激活 FLOPs 近似不变；共享专家隔离、不进 gate
-- 均衡默认 expert-bias（只改 top-k 选择）；aux 默认关闭，旧 checkpoint 形状不兼容时截断/丢弃，需续训
-- 前置通用路由：输入摘要 + 意图 embedding + PAD → 4 通道权重；推理时内容/检索低于 `ROUTER_SKIP_THRESHOLD=0.12` 可跳过；按意图锁定 top-2（情感+生成强制常驻）
+- TF-1：6 层，每层 16 路由 + 1 共享，动态开关，路由 FFN 1280 / 共享 FFN 2560
+- TF-2：6 层 decoder，每层 16 路由 + 2 共享，动态开关，路由 FFN 1920 / 共享 FFN 3840
+- 细粒度切分 `MOE_GRANULARITY=2`：路由专家数 ×2、路由 FFN /2；共享专家隔离、不进 gate
+- 路由专家按相对最高分 ≥0.40 开启；softmax 下最高 logit ≤0 则全关（只留共享），分数均匀则可全开；均衡默认 expert-bias；aux 默认关闭
+- 前置通用路由：输入摘要 + 意图 embedding + PAD → 4 通道权重；内容/情感/生成常驻，检索低于 `ROUTER_SKIP_THRESHOLD=0.06` 可跳过；按意图锁定 top-3
 - 词表 32000；输入 `MAX_LEN=256`、训练/生成 `TGT_MAX_LEN=GEN_MAX_LEN=256`；历史 6 轮 / 120 token，记忆单条 48 token
 - 意图 14 类（含 `lang_learning` / `rare_word`）
 - 回退：`ANWAN_BACKBONE=ssm` 或 `lstm`（LSTM-A hidden 8192 / 专家隐层 4096）
